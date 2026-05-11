@@ -1,0 +1,18 @@
+name: common_vi
+description: Common Vietnamese localization replacements
+
+replacements:
+  - ["có vẻ giống như khoa học tên lửa", "nghe có vẻ khó"]
+  - ["có vẻ như khoa học tên lửa", "nghe có vẻ khó"]
+  - ["giống như khoa học tên lửa", "nghe như việc rất khó"]
+  - ["khoa học tên lửa", "việc quá khó"]
+  - ["nhưng đừng lo lắng", "nhưng đừng lo"]
+  - ["khoa học tên lửa", "nghe có vẻ khó"]
+  - ["một việc rất phức tạp", "việc khó"]
+  - ["đừng đổ mồ hôi", "đừng lo"]
+  - ["nhưng đừng lo lắng", "nhưng đừng lo"]
+  - ["Đừng đi đâu cả", "Đừng vội rời đi"]
+  - ["cho đến nay, rất tốt", "đến giờ vẫn ổn"]
+  - ["Whew", "Phù"]
+  - ["Cảm ơn đã xem", "Cảm ơn mọi người đã xem"]
+  - ["đăng ký", "subscribe"]

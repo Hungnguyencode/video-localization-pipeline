@@ -1,0 +1,11 @@
+name: education_vi
+description: Education and tutorial video glossary
+
+replacements:
+  - ["khóa học", "bài học"]
+  - ["người học", "học viên"]
+  - ["hướng dẫn", "hướng dẫn"]
+  - ["bài giảng", "bài giảng"]
+  - ["chủ đề", "chủ đề"]
+  - ["khái niệm", "khái niệm"]
+  - ["ví dụ", "ví dụ"]

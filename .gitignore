@@ -1,0 +1,43 @@
+# =========================
+# 1. BẢO MẬT (TUYỆT ĐỐI KHÔNG PUSH)
+# =========================
+.env
+.env.local
+
+# =========================
+# 2. DỮ LIỆU MEDIA & KẾT QUẢ RENDER (NẶNG, BỎ QUA)
+# =========================
+# Bỏ qua toàn bộ file trong các thư mục data, nhưng giữ lại vỏ thư mục
+data/input/*
+data/audio/*
+data/transcripts/*
+data/subtitles/*
+data/tts_segments/*
+data/output/*
+
+# (Tùy chọn) Nếu muốn Git giữ lại cấu trúc thư mục rỗng, hãy tạo 1 file .gitkeep 
+# trong mỗi thư mục trên và bỏ comment các dòng dưới đây:
+!data/input/.gitkeep
+!data/audio/.gitkeep
+!data/transcripts/.gitkeep
+!data/subtitles/.gitkeep
+!data/tts_segments/.gitkeep
+!data/output/.gitkeep
+
+# =========================
+# 3. MÔI TRƯỜNG ẢO & CACHE PYTHON
+# =========================
+venv/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =========================
+# 4. OS & TOOLS CACHE
+# =========================
+.DS_Store
+Thumbs.db
+.streamlit/

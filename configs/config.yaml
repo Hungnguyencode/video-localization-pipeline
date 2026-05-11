@@ -1,0 +1,65 @@
+project:
+  name: "video-localization-pipeline"
+  version: "0.1.0"
+
+paths:
+  input_dir: "data/input"
+  audio_dir: "data/audio"
+  transcripts_dir: "data/transcripts"
+  subtitles_dir: "data/subtitles"
+  tts_segments_dir: "data/tts_segments"
+  output_dir: "data/output"
+
+audio:
+  sample_rate: 16000
+  channels: 1
+
+asr:
+  provider: "faster_whisper"
+  model_name: "small"
+  device: "auto"
+  compute_type: "int8_float16"
+  language: "auto"
+  fallback_to_cpu: true
+
+translation:
+  provider: "google_free"
+  source_language: "en"
+  target_language: "vi"
+  model_name: "Helsinki-NLP/opus-mt-en-vi"
+  sleep_seconds: 0.15
+
+  merge_segments:
+    enabled: true
+    max_duration_sec: 18.0
+    max_chars: 420
+
+  postprocess:
+    enabled: true
+    style: "natural_spoken"
+    shorten_for_tts: false
+    max_chars_per_second: 17.0
+
+    glossary_files:
+      - "configs/glossaries/common_vi.yaml"
+
+    replacements: []
+
+tts:
+  provider: "edge_tts"
+  voice: "vi-VN-NamMinhNeural"
+  rate: "+0%"
+  volume: "+0%"
+
+alignment:
+  max_speedup: 1.45
+  trim_if_too_long: false
+  silence_padding_ms: 80
+  min_gap_ms: 60
+
+render:
+  audio_mode: "replace"
+  burn_subtitle: false
+  original_audio_volume_db: -18
+  subtitle_max_chars_per_line: 42
+  output_video_suffix: "_vi_dubbed"

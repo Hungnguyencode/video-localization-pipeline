@@ -1,0 +1,11 @@
+name: news_vi
+description: News video glossary
+
+replacements:
+  - ["báo cáo cho biết", "theo báo cáo"]
+  - ["các quan chức", "giới chức"]
+  - ["chính phủ", "chính phủ"]
+  - ["kinh tế", "kinh tế"]
+  - ["thị trường", "thị trường"]
+  - ["lạm phát", "lạm phát"]
+  - ["cuộc khủng hoảng", "khủng hoảng"]

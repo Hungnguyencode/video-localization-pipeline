@@ -1,0 +1,12 @@
+name: technology_vi
+description: Technology and AI video glossary
+
+replacements:
+  - ["trí tuệ nhân tạo", "AI"]
+  - ["máy học", "machine learning"]
+  - ["học sâu", "deep learning"]
+  - ["mô hình ngôn ngữ lớn", "LLM"]
+  - ["đường ống dữ liệu", "pipeline dữ liệu"]
+  - ["đám mây", "cloud"]
+  - ["triển khai", "deploy"]
+  - ["mã nguồn mở", "mã nguồn mở"]

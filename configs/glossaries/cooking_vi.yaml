@@ -1,0 +1,21 @@
+name: cooking_vi
+description: Cooking and food video glossary
+
+replacements:
+  - ["bánh xèo Nhật", "pancake Nhật Bản"]
+  - ["bánh xèo Nhật Bản", "pancake Nhật Bản"]
+  - ["bánh kếp", "pancake"]
+  - ["bánh pancake", "pancake"]
+  - ["bánh trứng đường", "meringue"]
+  - ["bột tất cả mục đích", "bột mì đa dụng"]
+  - ["tất cả các mục đích", "bột mì đa dụng"]
+  - ["chiết xuất vani", "tinh chất vani"]
+  - ["nước tương", "xì dầu"]
+  - ["túi bánh ngọt", "túi bắt kem"]
+  - ["túi đựng bánh ngọt", "túi bắt kem"]
+  - ["Ném một giọt sữa", "Cho một ít sữa"]
+  - ["ném một giọt sữa", "cho một ít sữa"]
+  - ["lòng trắng trứng", "lòng trắng trứng"]
+  - ["lòng đỏ", "lòng đỏ trứng"]
+  - ["độ đặc tổng thể của bột", "độ sánh của hỗn hợp bột"]
+  - ["kem có độ đặc tốt", "hỗn hợp có độ sánh mịn"]
