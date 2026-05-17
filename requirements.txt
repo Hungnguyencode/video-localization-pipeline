@@ -21,3 +21,6 @@ deep-translator
 yt-dlp
 
 requests
+google-genai>=2.0.0
+google-generativeai
+google-cloud-texttospeech

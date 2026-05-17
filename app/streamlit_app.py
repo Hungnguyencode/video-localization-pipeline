@@ -84,6 +84,24 @@ GLOSSARY_DOMAIN_OPTIONS = {
     "Công nghệ / AI": ["configs/glossaries/common_vi.yaml", "configs/glossaries/technology_vi.yaml"],
 }
 
+# Mapping domain trên UI -> content_domain cho GeminiTranslator.
+# Khi người dùng chọn glossary theo lĩnh vực, Gemini sẽ tự đổi cách xưng hô phù hợp.
+GEMINI_CONTENT_DOMAIN_OPTIONS = {
+    "Chung": "general",
+    "Nấu ăn": "cooking",
+    "Giáo dục": "education",
+    "Tin tức": "news",
+    "Công nghệ / AI": "technology",
+}
+
+GEMINI_DOMAIN_STYLE_HINTS = {
+    "Chung": "Xưng hô tự nhiên, mặc định thân thiện.",
+    "Nấu ăn": "Xưng hô: mình - bạn, hợp video hướng dẫn/nấu ăn.",
+    "Giáo dục": "Xưng hô: thầy/cô - em/các em, hợp video bài giảng.",
+    "Tin tức": "Xưng hô: tôi/chúng tôi - quý vị, hợp bản tin/phóng sự.",
+    "Công nghệ / AI": "Xưng hô: tôi - bạn/các bạn, rõ ràng và trung tính.",
+}
+
 SPEAKER_ROLE_OPTIONS = [
     "Mặc định",
     "Người dẫn / Speaker A",
@@ -148,6 +166,42 @@ def apply_runtime_glossary_to_pipeline(
     return final_replacements
 
 
+def apply_runtime_domain_to_pipeline(
+    pipeline: VideoLocalizationPipeline,
+    selected_domain: str,
+    pronoun_style: str = "auto",
+) -> dict[str, str]:
+    """
+    Áp dụng domain/xưng hô được chọn trên Streamlit vào GeminiTranslator runtime.
+
+    Vì get_pipeline() dùng st.cache_resource nên pipeline/translator có thể được cache.
+    Do đó mỗi lần chạy prepare_translation cần set lại content_domain/pronoun_style
+    trước khi gọi pipeline.prepare_translation(...).
+    """
+    content_domain = GEMINI_CONTENT_DOMAIN_OPTIONS.get(selected_domain, "general")
+    translator = getattr(pipeline, "translator", None)
+
+    if translator is not None:
+        if hasattr(translator, "content_domain"):
+            translator.content_domain = content_domain
+        if hasattr(translator, "pronoun_style"):
+            translator.pronoun_style = pronoun_style
+
+    print(
+        "[STREAMLIT] Applied Gemini domain/pronoun: "
+        f"selected_domain={selected_domain}, "
+        f"content_domain={content_domain}, "
+        f"pronoun_style={pronoun_style}"
+    )
+
+    return {
+        "selected_domain": selected_domain,
+        "content_domain": content_domain,
+        "pronoun_style": pronoun_style,
+        "style_hint": GEMINI_DOMAIN_STYLE_HINTS.get(selected_domain, ""),
+    }
+
+
 def save_glossary_metadata_to_bilingual(
     bilingual_path: str | Path,
     domain_name: str,
@@ -160,6 +214,12 @@ def save_glossary_metadata_to_bilingual(
         "files": glossary_files,
         "replacements_count": len(replacements),
         "replacements": replacements,
+    }
+    data["gemini_style"] = {
+        "selected_domain": domain_name,
+        "content_domain": GEMINI_CONTENT_DOMAIN_OPTIONS.get(domain_name, "general"),
+        "pronoun_style": "auto",
+        "style_hint": GEMINI_DOMAIN_STYLE_HINTS.get(domain_name, ""),
     }
     save_json(data, bilingual_path)
 
@@ -708,7 +768,7 @@ def show_download_button(path_value: str | None, label: str, mime: str) -> None:
         st.warning(f"Không tìm thấy file: {path}")
         return
     with path.open("rb") as f:
-        st.download_button(label=label, data=f, file_name=path.name, mime=mime, use_container_width=True)
+        st.download_button(label=label, data=f, file_name=path.name, mime=mime, width="stretch")
 
 
 def reset_working_state() -> None:
@@ -739,6 +799,13 @@ def run_prepare_translation(input_path: Path, selected_domain: str, selected_glo
     with st.spinner("Đang chạy ASR + merge segment + dịch + hậu xử lý..."):
         try:
             pipeline = get_pipeline()
+
+            runtime_domain_info = apply_runtime_domain_to_pipeline(
+                pipeline=pipeline,
+                selected_domain=selected_domain,
+                pronoun_style="auto",
+            )
+
             runtime_replacements = apply_runtime_glossary_to_pipeline(
                 pipeline=pipeline,
                 glossary_files=selected_glossary_files,
@@ -758,6 +825,7 @@ def run_prepare_translation(input_path: Path, selected_domain: str, selected_glo
             st.session_state["selected_domain"] = selected_domain
             st.session_state["selected_glossary_files"] = selected_glossary_files
             st.session_state["runtime_replacements_count"] = len(runtime_replacements)
+            st.session_state["runtime_domain_info"] = runtime_domain_info
             st.session_state.pop("render_result", None)
             st.session_state.pop("edited_bilingual_path", None)
             st.session_state.pop("preview_audio_path", None)
@@ -802,6 +870,12 @@ st.subheader("0. Cấu hình dịch và glossary")
 with st.expander("🌐 Glossary theo lĩnh vực", expanded=True):
     selected_domain = st.selectbox("Chọn lĩnh vực video", options=list(GLOSSARY_DOMAIN_OPTIONS.keys()), index=3)
     selected_glossary_files = GLOSSARY_DOMAIN_OPTIONS[selected_domain]
+    selected_content_domain = GEMINI_CONTENT_DOMAIN_OPTIONS.get(selected_domain, "general")
+    selected_style_hint = GEMINI_DOMAIN_STYLE_HINTS.get(selected_domain, "")
+    st.info(
+        f"Gemini sẽ dùng content_domain=`{selected_content_domain}` và pronoun_style=`auto`. "
+        f"{selected_style_hint}"
+    )
     st.caption("Glossary files đang dùng:")
     for glossary_file in selected_glossary_files:
         st.code(glossary_file, language="text")
@@ -830,7 +904,7 @@ else:
     youtube_url = st.text_input("Nhập YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
     max_height_label = st.selectbox("Giới hạn độ phân giải tải về", options=["480p - nhẹ, nhanh", "720p - cân bằng", "1080p - nặng hơn"], index=1)
     max_height_map = {"480p - nhẹ, nhanh": 480, "720p - cân bằng": 720, "1080p - nặng hơn": 1080}
-    if st.button("Tải video YouTube về data/input", type="primary", use_container_width=True):
+    if st.button("Tải video YouTube về data/input", type="primary", width="stretch"):
         with st.spinner("Đang tải video từ YouTube bằng yt-dlp..."):
             try:
                 download_result = download_youtube_to_input(url=youtube_url, max_height=max_height_map[max_height_label])
@@ -852,9 +926,9 @@ if input_path is not None and input_path.exists():
     st.video(str(input_path))
     col_prepare, col_reset = st.columns([2, 1])
     with col_prepare:
-        prepare_button = st.button("Bước 1: Tạo transcript + bản dịch", type="primary", use_container_width=True)
+        prepare_button = st.button("Bước 1: Tạo transcript + bản dịch", type="primary", width="stretch")
     with col_reset:
-        reset_button = st.button("Reset phiên làm việc", use_container_width=True)
+        reset_button = st.button("Reset phiên làm việc", width="stretch")
     if reset_button:
         reset_working_state()
         st.success("Đã reset trạng thái giao diện. File trong thư mục data vẫn được giữ nguyên.")
@@ -888,7 +962,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
     if edited_candidate.exists():
         with st.expander("💾 Có bản chỉnh sửa cũ", expanded=False):
             st.write(f"Tìm thấy file: `{edited_candidate}`")
-            if st.button("Tải lại bản chỉnh sửa cũ", use_container_width=True):
+            if st.button("Tải lại bản chỉnh sửa cũ", width="stretch"):
                 edited_data = load_json(edited_candidate)
                 st.session_state["editor_df"] = build_editor_dataframe(edited_data)
                 st.session_state["edited_bilingual_path"] = str(edited_candidate)
@@ -903,7 +977,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
         filtered_df = filter_editor_dataframe(editor_df, search_keyword)
         edited_table_df = st.data_editor(
             filtered_df,
-            use_container_width=True,
+            width="stretch",
             height=560,
             hide_index=True,
             disabled=["segment_id", "start", "end", "duration", "tts_risk", "chars_per_sec", "source_text", "raw_vi_text", "voice", "rate"],
@@ -960,7 +1034,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                 with st.form("bulk_role_form"):
                     role_range_text = st.text_input("Khoảng segment gán role", placeholder="Ví dụ: 1-3,7")
                     bulk_role = st.selectbox("Speaker role", options=[r for r in SPEAKER_ROLE_OPTIONS if r != "Mặc định"], index=0)
-                    submitted_role = st.form_submit_button("Áp dụng speaker role", use_container_width=True)
+                    submitted_role = st.form_submit_button("Áp dụng speaker role", width="stretch")
                     if submitted_role:
                         try:
                             count = apply_role_to_segment_ranges(role_range_text, bulk_role, role_voice_map_ui)
@@ -973,7 +1047,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                 with st.form("bulk_voice_form"):
                     voice_range_text = st.text_input("Khoảng segment gán voice", placeholder="Ví dụ: 1-3,7")
                     bulk_voice_label = st.selectbox("Voice cần gán", options=list(VOICE_OPTIONS.keys()), index=1)
-                    submitted_voice = st.form_submit_button("Áp dụng voice", use_container_width=True)
+                    submitted_voice = st.form_submit_button("Áp dụng voice", width="stretch")
                     if submitted_voice:
                         try:
                             count = apply_voice_to_segment_ranges(voice_range_text, bulk_voice_label)
@@ -987,7 +1061,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
             with st.form("merge_form"):
                 merge_range_text = st.text_input("Nhập khoảng segment cần gộp", placeholder="Ví dụ: 8-9 hoặc 14-16")
                 merge_voice_strategy = st.selectbox("Giọng sau khi gộp", options=["Giữ giọng segment đầu", "Giữ giọng segment cuối"], index=0)
-                submitted_merge = st.form_submit_button("Gộp các segment này", use_container_width=True)
+                submitted_merge = st.form_submit_button("Gộp các segment này", width="stretch")
                 if submitted_merge:
                     try:
                         count = merge_segment_ranges(merge_range_text, voice_strategy="last" if "cuối" in merge_voice_strategy else "first")
@@ -1027,7 +1101,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
         new_vi_text = st.text_area("Final VI", value=str(selected_row["vi_text"]), height=140, label_visibility="collapsed", key=f"segment_text_area_{selected_segment_id}_{st.session_state.get('editor_version', 0)}")
 
         col_update, col_restore = st.columns(2)
-        if col_update.button("Cập nhật đoạn này", type="primary", use_container_width=True):
+        if col_update.button("Cập nhật đoạn này", type="primary", width="stretch"):
             update_segment_text(int(selected_segment_id), new_vi_text)
             update_segment_voice(int(selected_segment_id), segment_voice_label)
             update_segment_rate(int(selected_segment_id), segment_rate_label, manual=True)
@@ -1035,7 +1109,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
             st.session_state["editor_df"].loc[mask, "source_text"] = source_area.strip()
             st.success(f"Đã cập nhật segment {selected_segment_id}.")
             st.rerun()
-        if col_restore.button("Khôi phục về raw VI", use_container_width=True):
+        if col_restore.button("Khôi phục về raw VI", width="stretch"):
             update_segment_text(int(selected_segment_id), str(selected_row["raw_vi_text"]))
             st.success(f"Đã khôi phục segment {selected_segment_id}.")
             st.rerun()
@@ -1055,7 +1129,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
             split_vi_1 = st.text_area("VI phần 1", value=vi1, height=90)
             split_src_2 = st.text_area("Source phần 2", value=src2, height=80)
             split_vi_2 = st.text_area("VI phần 2", value=vi2, height=90)
-            if st.button("Tách segment này", use_container_width=True):
+            if st.button("Tách segment này", width="stretch"):
                 try:
                     split_segment(int(selected_segment_id), split_time, split_src_1, split_src_2, split_vi_1, split_vi_2)
                     st.success("Đã tách segment.")
@@ -1065,7 +1139,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                     st.exception(e)
 
         st.markdown("#### Nghe thử TTS đoạn này")
-        if st.button("Tạo và nghe thử audio đoạn này", use_container_width=True):
+        if st.button("Tạo và nghe thử audio đoạn này", width="stretch"):
             with st.spinner("Đang tạo preview TTS cho đoạn này..."):
                 try:
                     preview_audio_path = make_preview_audio(
@@ -1089,7 +1163,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
         if qdf.empty:
             st.success("Không phát hiện cảnh báo đáng kể.")
         else:
-            st.dataframe(qdf, use_container_width=True, height=420)
+            st.dataframe(qdf, width="stretch", height=420)
             st.caption("Các cảnh báo này không chặn render, nhưng nên xử lý các dòng 'Nặng' và 'Cảnh báo' trước khi demo.")
 
     with tab_render:
@@ -1137,11 +1211,19 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                     "outline_colour": "&H00000000",
                 }
 
-        clear_cache = st.checkbox("Xóa cache TTS và tạo lại toàn bộ giọng đọc", value=True)
+        clear_cache = st.checkbox(
+            "Tạo lại toàn bộ TTS từ đầu",
+            value=False,
+            help=(
+                "Bình thường hãy để TẮT để dùng lại cache TTS cũ, render nhanh hơn rất nhiều. "
+                "Chỉ BẬT khi bạn đã sửa text/voice/rate và muốn xóa toàn bộ audio cũ. "
+                "Nếu dùng FPT.AI thì không nên bật khi render thử, vì FPT tạo giọng khá chậm."
+            ),
+        )
         st.warning("Khi render, hệ thống sẽ dùng bản dịch/segment/voice/rate hiện tại. Xem tab Quality check trước nếu muốn demo mượt.")
 
         col_save, col_render = st.columns(2)
-        if col_save.button("Lưu bản dịch đã chỉnh", use_container_width=True):
+        if col_save.button("Lưu bản dịch đã chỉnh", width="stretch"):
             try:
                 render_df_for_save = build_render_dataframe(
                     st.session_state["editor_df"],
@@ -1158,7 +1240,7 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                 st.error("Lỗi khi lưu bản dịch đã chỉnh.")
                 st.exception(e)
 
-        if col_render.button("Bước 2: Tạo video từ bản đã chỉnh", type="primary", use_container_width=True):
+        if col_render.button("Bước 2: Tạo video từ bản đã chỉnh", type="primary", width="stretch"):
             try:
                 role_voice_map_render = build_role_voice_map(st.session_state.get("role_a_voice", "Nữ - HoaiMy"), st.session_state.get("role_b_voice", "Nam - NamMinh"), st.session_state.get("role_c_voice", "Nữ - HoaiMy"))
                 render_df = build_render_dataframe(

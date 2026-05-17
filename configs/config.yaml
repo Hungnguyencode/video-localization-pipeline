@@ -1,6 +1,6 @@
 project:
   name: "video-localization-pipeline"
-  version: "0.1.0"
+  version: "0.2.0-fpt-gemini"
 
 paths:
   input_dir: "data/input"
@@ -23,32 +23,46 @@ asr:
   fallback_to_cpu: true
 
 translation:
-  provider: "google_free"
+  provider: "gemini"
   source_language: "en"
   target_language: "vi"
   model_name: "Helsinki-NLP/opus-mt-en-vi"
   sleep_seconds: 0.15
 
+  gemini:
+    api_key_env: "GEMINI_API_KEY"
+    model_name: "gemini-2.5-flash"
+    temperature: 0.2
+    max_output_tokens: 8192
+    batch_size: 12
+    max_batch_chars: 6000
+    request_sleep_seconds: 0.15
+    max_retries: 4
+    retry_base_seconds: 2.0
+    cache_enabled: true
+    cache_path: "data/cache/gemini_translation_cache_v2.json"
+    fallback_provider: "google_free"
+    content_domain: "general"
+    pronoun_style: "auto"
+
   merge_segments:
     enabled: true
-    max_duration_sec: 18.0
-    max_chars: 420
+    max_duration_sec: 16.0
+    max_chars: 360
 
   postprocess:
     enabled: true
     style: "natural_spoken"
     shorten_for_tts: false
     max_chars_per_second: 17.0
-
     glossary_files:
       - "configs/glossaries/common_vi.yaml"
-
     replacements: []
 
 tts:
-  provider: "edge_tts"
-  voice: "vi-VN-NamMinhNeural"
-  rate: "+0%"
+  provider: "fpt_ai"
+  voice: "fpt:banmai"
+  rate: "+15%"
   volume: "+0%"
 
 alignment:

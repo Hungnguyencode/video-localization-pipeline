@@ -3,24 +3,51 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-
 TERMINAL_PUNCTUATION = (".", "?", "!", "…")
 
-# Cụm kết thúc yếu: nếu segment hiện tại kết thúc bằng các cụm này thì nên nối với segment sau.
-WEAK_ENDINGS = {
-    "a",
-    "an",
-    "the",
-    "to",
+
+# Các từ/cụm bắt đầu yếu: nếu segment sau bắt đầu bằng các từ này
+# thì nhiều khả năng segment đó là phần tiếp của câu trước.
+DEFAULT_WEAK_START_WORDS = {
+    # Vietnamese
+    "về",
+    "và",
+    "nhưng",
+    "nên",
+    "rồi",
+    "thì",
+    "để",
+    "cho",
+    "bằng",
+    "của",
+    "khi",
+    "nếu",
+    "mà",
+    "hoặc",
+    "hay",
+    "từ",
+    "trong",
+    "với",
+    "như",
+    "là",
+    "ở",
+    "đến",
+    "cùng",
+    "còn",
+    "cũng",
+
+    # English
+    "about",
+    "and",
+    "but",
+    "so",
+    "because",
     "of",
+    "to",
     "for",
     "with",
-    "without",
     "that",
     "which",
-    "who",
-    "whom",
-    "whose",
     "where",
     "when",
     "why",
@@ -28,60 +55,50 @@ WEAK_ENDINGS = {
     "in",
     "on",
     "at",
-    "from",
     "by",
     "as",
+    "from",
     "into",
-    "about",
     "around",
     "between",
-    "and",
-    "or",
-    "but",
-    "so",
-    "because",
-    "due",
-    "due to",
-    "rising",
-    "fuel",
-    "travel",
-    "coming",
-    "coming days",
-    "there is a",
-    "there's a",
-    "is a",
-    "are a",
-    "a little",
-    "carry",
-    "carry out",
-    "implement",
-    "mitigate",
 }
 
-# Cụm bắt đầu yếu: nếu segment sau bắt đầu bằng các cụm này thì nhiều khả năng là phần tiếp của câu trước.
-WEAK_STARTS = {
-    "prices",
-    "price",
-    "weeks",
-    "months",
-    "days",
-    "plans",
-    "routes",
-    "hubs",
-    "airports",
-    "flights",
-    "airlines",
-    "fuel",
-    "middle",
-    "east",
-    "from",
-    "to",
+
+# Các từ/cụm kết thúc yếu: nếu segment hiện tại kết thúc bằng các từ này
+# thì nên nối với segment sau.
+DEFAULT_WEAK_END_WORDS = {
+    # Vietnamese
+    "và",
+    "nhưng",
+    "vì",
+    "để",
+    "cho",
+    "bằng",
+    "của",
+    "khi",
+    "nếu",
+    "về",
+    "từ",
+    "trong",
+    "với",
+    "như",
+    "là",
+    "ở",
+    "đến",
+    "cùng",
+    "còn",
+    "cũng",
+
+    # English
+    "and",
+    "but",
+    "because",
     "of",
+    "to",
     "for",
     "with",
     "that",
     "which",
-    "who",
     "where",
     "when",
     "why",
@@ -91,14 +108,10 @@ WEAK_STARTS = {
     "at",
     "by",
     "as",
-    "and",
-    "or",
-    "but",
-    "so",
-    "because",
-    "little",
-    "plans",
-    "going",
+    "from",
+    "into",
+    "around",
+    "between",
 }
 
 
@@ -118,7 +131,25 @@ def _get_source_text(segment: Dict[str, Any]) -> str:
 
 
 def _duration(segment: Dict[str, Any]) -> float:
-    return max(0.0, float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)))
+    return max(
+        0.0,
+        float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)),
+    )
+
+
+def _gap_between(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    return float(b.get("start", 0.0)) - float(a.get("end", 0.0))
+
+
+def _first_word(text: str) -> str:
+    text = _clean_text(text).lower()
+    match = re.match(r"^[\W_]*([\wÀ-ỹ']+)", text, flags=re.UNICODE)
+    return match.group(1) if match else ""
+
+
+def _last_word(text: str) -> str:
+    words = re.findall(r"[\wÀ-ỹ']+", _clean_text(text).lower(), flags=re.UNICODE)
+    return words[-1] if words else ""
 
 
 def _starts_lowercase(text: str) -> bool:
@@ -132,92 +163,76 @@ def _starts_lowercase(text: str) -> bool:
 
 
 def _ends_with_terminal_punctuation(text: str) -> bool:
-    text = _clean_text(text)
-
-    if not text:
-        return False
-
-    text = text.rstrip('"”’)]}')
-    return text.endswith(TERMINAL_PUNCTUATION)
+    return _clean_text(text).endswith(TERMINAL_PUNCTUATION)
 
 
-def _last_words(text: str, n: int = 3) -> str:
-    words = re.findall(r"[A-Za-z']+", text.lower())
-    return " ".join(words[-n:])
+def _starts_with_weak_word(text: str, weak_start_words: set[str]) -> bool:
+    first_word = _first_word(text)
+    return first_word in weak_start_words
 
 
-def _first_word(text: str) -> str:
-    words = re.findall(r"[A-Za-z']+", text.lower())
-    return words[0] if words else ""
+def _ends_with_weak_word(text: str, weak_end_words: set[str]) -> bool:
+    last_word = _last_word(text)
+    return last_word in weak_end_words
 
 
-def _ends_with_weak_phrase(text: str) -> bool:
-    text = _clean_text(text).lower()
-    text = text.rstrip(".,!?;: ")
-
-    for n in (3, 2, 1):
-        phrase = _last_words(text, n=n)
-        if phrase in WEAK_ENDINGS:
-            return True
-
-    return False
-
-
-def _starts_with_weak_phrase(text: str) -> bool:
-    first = _first_word(text)
-
-    if not first:
-        return False
-
-    return first in WEAK_STARTS
-
-
-def _looks_like_continuation(prev_text: str, next_text: str) -> bool:
+def _looks_like_continuation(
+    current: Dict[str, Any],
+    nxt: Dict[str, Any],
+    max_gap_sec: float,
+    weak_start_words: set[str],
+    weak_end_words: set[str],
+) -> bool:
     """
-    Chỉ merge khi có dấu hiệu continuation rõ ràng.
+    Xác định ranh giới hiện tại có giống một câu bị cắt lẻ không.
 
-    Không còn dùng rule quá rộng: "câu trước không có dấu chấm thì merge".
-    Rule đó làm news/interview bị over-merge thành segment 20-30 giây.
+    Ví dụ cần merge:
+    - Segment trước: "Nhân tiện, mình rất muốn nghe ý kiến của bạn."
+    - Segment sau:   "về cách mình có thể làm video tốt hơn nữa."
+
+    Hoặc:
+    - Segment sau bắt đầu bằng chữ thường.
+    - Segment trước chưa có dấu kết thúc câu.
+    - Segment sau bắt đầu bằng từ nối/yếu.
+    - Segment trước kết thúc bằng từ nối/yếu.
     """
-
-    prev_text = _clean_text(prev_text)
-    next_text = _clean_text(next_text)
-
-    if not prev_text or not next_text:
-        return False
-
-    if prev_text.endswith((",", ";", ":")):
-        return True
-
-    if _starts_lowercase(next_text):
-        return True
-
-    if _ends_with_weak_phrase(prev_text):
-        return True
-
-    if _starts_with_weak_phrase(next_text):
-        return True
-
-    return False
-
-
-def _short_unpunctuated_bridge_allowed(current: Dict[str, Any], nxt: Dict[str, Any]) -> bool:
-    """
-    Một số ASR không chấm câu tốt. Cho phép nối khi segment hiện tại rất ngắn,
-    chưa có dấu kết thúc và segment sau có vẻ là continuation.
-    Không dùng cho segment dài để tránh over-merge.
-    """
-
     current_text = _get_source_text(current)
     next_text = _get_source_text(nxt)
 
-    if _ends_with_terminal_punctuation(current_text):
+    if not current_text or not next_text:
         return False
 
-    if _duration(current) > 5.5:
+    gap = _gap_between(current, nxt)
+
+    # Nếu khoảng cách quá xa thì không nối, tránh nối sai ý.
+    if gap > max_gap_sec:
         return False
 
-    return _starts_lowercase(next_text) or _starts_with_weak_phrase(next_text) or _ends_with_weak_phrase(current_text)
+    # Case 1: segment sau bắt đầu bằng chữ thường.
+    # Đây là dấu hiệu rất mạnh rằng nó là phần tiếp của câu trước.
+    if _starts_lowercase(next_text):
+        return True
+
+    # Case 2: segment sau bắt đầu bằng từ yếu như "về", "và", "nhưng"...
+    if _starts_with_weak_word(next_text, weak_start_words):
+        return True
+
+    # Case 3: segment trước kết thúc bằng từ yếu như "và", "về", "để"...
+    if _ends_with_weak_word(current_text, weak_end_words):
+        return True
+
+    # Case 4: segment trước chưa có dấu kết thúc câu,
+    # và segment sau nhìn giống continuation.
+    if (
+        not _ends_with_terminal_punctuation(current_text)
+        and (
+            _starts_lowercase(next_text)
+            or _starts_with_weak_word(next_text, weak_start_words)
+        )
+    ):
+        return True
+
+    return False
 
 
 def _merge_two_segments(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -227,37 +242,9 @@ def _merge_two_segments(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     merged_text = _clean_text(f"{a_text} {b_text}")
 
     merged = dict(a)
-    merged["start"] = float(a["start"])
-    merged["end"] = float(b["end"])
     merged["text"] = merged_text
     merged["source_text"] = merged_text
-
-    merged_from = []
-
-    if "merged_from" in a:
-        merged_from.extend(a["merged_from"])
-    else:
-        merged_from.append(
-            {
-                "start": float(a["start"]),
-                "end": float(a["end"]),
-                "text": a_text,
-            }
-        )
-
-    if "merged_from" in b:
-        merged_from.extend(b["merged_from"])
-    else:
-        merged_from.append(
-            {
-                "start": float(b["start"]),
-                "end": float(b["end"]),
-                "text": b_text,
-            }
-        )
-
-    merged["merged_from"] = merged_from
-    merged["merged_count"] = len(merged_from)
+    merged["end"] = b.get("end", a.get("end", 0.0))
 
     return merged
 
@@ -265,83 +252,99 @@ def _merge_two_segments(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 def merge_segments_for_translation(
     segments: List[Dict[str, Any]],
     enabled: bool = True,
-    max_merged_duration_sec: float = 16.0,
-    max_merged_chars: int = 420,
-    continuation_max_duration_sec: float = 18.0,
-    continuation_max_chars: int = 480,
+    max_merged_duration_sec: float = 22.0,
+    max_merged_chars: int = 520,
+    continuation_max_duration_sec: float = 24.0,
+    continuation_max_chars: int = 600,
+    merge_weak_boundaries: bool = True,
+    max_gap_sec: float = 1.2,
+    weak_start_words: List[str] | None = None,
+    weak_end_words: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Gộp segment trước khi dịch, nhưng không merge quá tham.
+    Gộp segment ASR trước khi dịch.
 
     Mục tiêu:
-    - Gộp các chỗ bị cắt cụt: "rising fuel" + "prices...".
-    - Tránh over-merge news/interview thành segment 20-30 giây.
-    - Không cố gộp qua nhiều câu hỏi/đáp vì sẽ làm mất khả năng gán giọng từng người.
-    """
+    - Giảm lỗi segment bị cắt lẻ.
+    - Gộp câu bị tách vụn trước khi đưa cho Gemini/translator.
+    - Không gộp quá dài để tránh phụ đề/TTS quá nặng.
 
+    Tham số tương thích với code cũ:
+    - enabled
+    - max_merged_duration_sec
+    - max_merged_chars
+    - continuation_max_duration_sec
+    - continuation_max_chars
+
+    Tham số mới:
+    - merge_weak_boundaries
+    - max_gap_sec
+    - weak_start_words
+    - weak_end_words
+    """
     if not enabled:
         return segments
 
     if not segments:
         return []
 
-    normalized_segments: List[Dict[str, Any]] = []
+    weak_start_set = set(weak_start_words or DEFAULT_WEAK_START_WORDS)
+    weak_end_set = set(weak_end_words or DEFAULT_WEAK_END_WORDS)
 
-    for item in segments:
-        new_item = dict(item)
-        text = _get_source_text(new_item)
-        new_item["text"] = text
-        new_item["source_text"] = text
-        normalized_segments.append(new_item)
+    sorted_segments = sorted(
+        [dict(item) for item in segments],
+        key=lambda item: (
+            float(item.get("start", 0.0)),
+            float(item.get("end", 0.0)),
+        ),
+    )
 
     output: List[Dict[str, Any]] = []
-    i = 0
+    current = dict(sorted_segments[0])
 
-    while i < len(normalized_segments):
-        current = normalized_segments[i]
-        i += 1
+    for nxt in sorted_segments[1:]:
+        nxt = dict(nxt)
 
-        while i < len(normalized_segments):
-            nxt = normalized_segments[i]
+        merged_candidate = _merge_two_segments(current, nxt)
+        candidate_duration = _duration(merged_candidate)
+        candidate_chars = len(_get_source_text(merged_candidate))
 
-            current_text = _get_source_text(current)
-            next_text = _get_source_text(nxt)
+        should_merge = False
 
-            candidate_duration = float(nxt["end"]) - float(current["start"])
-            candidate_chars = len(_clean_text(f"{current_text} {next_text}"))
-
-            continuation = _looks_like_continuation(current_text, next_text)
-            short_bridge = _short_unpunctuated_bridge_allowed(current, nxt)
-
-            normal_merge_allowed = (
-                (continuation or short_bridge)
-                and candidate_duration <= float(max_merged_duration_sec)
-                and candidate_chars <= int(max_merged_chars)
+        if merge_weak_boundaries:
+            should_merge = _looks_like_continuation(
+                current=current,
+                nxt=nxt,
+                max_gap_sec=max_gap_sec,
+                weak_start_words=weak_start_set,
+                weak_end_words=weak_end_set,
             )
 
-            # Chỉ nới giới hạn khi continuation rất rõ ràng.
-            clear_continuation = (
-                _ends_with_weak_phrase(current_text)
-                or _starts_with_weak_phrase(next_text)
-                or current_text.endswith((",", ";", ":"))
-            )
-
-            continuation_merge_allowed = (
-                clear_continuation
-                and candidate_duration <= float(continuation_max_duration_sec)
+        # Nếu đúng là continuation rõ ràng thì cho phép ngưỡng rộng hơn một chút.
+        if should_merge:
+            can_merge = (
+                candidate_duration <= float(continuation_max_duration_sec)
                 and candidate_chars <= int(continuation_max_chars)
             )
+        else:
+            can_merge = (
+                candidate_duration <= float(max_merged_duration_sec)
+                and candidate_chars <= int(max_merged_chars)
+                and not _ends_with_terminal_punctuation(_get_source_text(current))
+                and _gap_between(current, nxt) <= max_gap_sec
+            )
 
-            if normal_merge_allowed or continuation_merge_allowed:
-                current = _merge_two_segments(current, nxt)
-                i += 1
-                continue
+        if can_merge:
+            current = merged_candidate
+        else:
+            output.append(current)
+            current = nxt
 
-            break
+    output.append(current)
 
-        output.append(current)
-
+    # Đánh lại id cho đẹp sau khi merge.
     for idx, item in enumerate(output, start=1):
+        item["id"] = idx
         item["segment_id"] = idx
 
     return output

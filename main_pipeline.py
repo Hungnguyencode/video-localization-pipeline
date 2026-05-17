@@ -21,14 +21,11 @@ from src.video_render.renderer import VideoRenderer
 class VideoLocalizationPipeline:
     def __init__(self, config_path: str = "configs/config.yaml"):
         self.config = load_config(config_path)
-
         paths = self.config["paths"]
-
         for path_value in paths.values():
             ensure_dir(path_value)
 
         self.ingestor = LocalVideoIngestor(paths["input_dir"])
-
         self.audio_extractor = AudioExtractor(
             output_dir=paths["audio_dir"],
             sample_rate=self.config["audio"].get("sample_rate", 16000),
@@ -50,8 +47,8 @@ class VideoLocalizationPipeline:
         tts_cfg = self.config["tts"]
         self.tts_engine = EdgeTTSEngine(
             output_dir=paths["tts_segments_dir"],
-            voice=tts_cfg.get("voice", "vi-VN-HoaiMyNeural"),
-            rate=tts_cfg.get("rate", "+0%"),
+            voice=tts_cfg.get("voice", "fpt:banmai"),
+            rate=tts_cfg.get("rate", "+15%"),
             volume=tts_cfg.get("volume", "+0%"),
         )
 
@@ -75,78 +72,34 @@ class VideoLocalizationPipeline:
         return base / filename if filename else base
 
     def prepare_translation(self, video_path: str | Path) -> Dict[str, Any]:
-        """
-        Chạy đến bước tạo transcript + bản dịch.
-        Chưa TTS, chưa render video.
-
-        Dùng cho Streamlit:
-        - Upload video
-        - ASR
-        - Merge segment
-        - Dịch
-        - Postprocess
-        - Hiện bảng để người dùng sửa bản dịch
-        """
-        # 1. Ingest video
         ingest_result = self.ingestor.ingest(video_path)
         video_stem = ingest_result["video_stem"]
         local_video_path = ingest_result["video_path"]
         video_name = ingest_result["video_name"]
-
         video_duration = get_video_duration_seconds(local_video_path)
 
-        # 2. Extract audio
-        audio_path = self.audio_extractor.extract(
-            video_path=local_video_path,
-            video_stem=video_stem,
-        )
-
-        # 3. ASR
-        asr_result = self.asr.transcribe(
-            audio_path=audio_path,
-            video_name=video_name,
-        )
-
+        audio_path = self.audio_extractor.extract(video_path=local_video_path, video_stem=video_stem)
+        asr_result = self.asr.transcribe(audio_path=audio_path, video_name=video_name)
         raw_segments = asr_result["segments"]
 
-        transcript_path = self._path(
-            "transcripts_dir",
-            f"{video_stem}_source_transcript.json",
-        )
+        transcript_path = self._path("transcripts_dir", f"{video_stem}_source_transcript.json")
         save_json(asr_result, transcript_path)
 
-        source_srt_path = self._path(
-            "subtitles_dir",
-            f"{video_stem}_source.srt",
-        )
-        self.subtitle_writer.write_source_srt(
-            raw_segments,
-            source_srt_path,
-        )
+        source_srt_path = self._path("subtitles_dir", f"{video_stem}_source.srt")
+        self.subtitle_writer.write_source_srt(raw_segments, source_srt_path)
 
-        # 4. Merge broken ASR segments before translation
         merge_cfg = self.config["translation"].get("merge_segments", {})
-
         segments_for_translation = merge_segments_for_translation(
             raw_segments,
             enabled=merge_cfg.get("enabled", True),
-            max_merged_duration_sec=merge_cfg.get("max_duration_sec", 12.0),
-            max_merged_chars=merge_cfg.get("max_chars", 280),
+            max_merged_duration_sec=merge_cfg.get("max_duration_sec", 16.0),
+            max_merged_chars=merge_cfg.get("max_chars", 360),
         )
 
-        merged_source_srt_path = self._path(
-            "subtitles_dir",
-            f"{video_stem}_source_merged.srt",
-        )
-        self.subtitle_writer.write_source_srt(
-            segments_for_translation,
-            merged_source_srt_path,
-        )
+        merged_source_srt_path = self._path("subtitles_dir", f"{video_stem}_source_merged.srt")
+        self.subtitle_writer.write_source_srt(segments_for_translation, merged_source_srt_path)
 
-        merged_transcript_path = self._path(
-            "transcripts_dir",
-            f"{video_stem}_source_merged_transcript.json",
-        )
+        merged_transcript_path = self._path("transcripts_dir", f"{video_stem}_source_merged_transcript.json")
         save_json(
             {
                 "video_name": video_name,
@@ -158,11 +111,7 @@ class VideoLocalizationPipeline:
             merged_transcript_path,
         )
 
-        # 5. Translate merged segments
-        translated_segments = self.translator.translate_segments(
-            segments_for_translation
-        )
-
+        translated_segments = self.translator.translate_segments(segments_for_translation)
         bilingual_data = {
             "video_name": video_name,
             "video_stem": video_stem,
@@ -175,22 +124,11 @@ class VideoLocalizationPipeline:
             "merged_segments_count": len(segments_for_translation),
             "segments": translated_segments,
         }
-
-        bilingual_path = self._path(
-            "transcripts_dir",
-            f"{video_stem}_bilingual.json",
-        )
+        bilingual_path = self._path("transcripts_dir", f"{video_stem}_bilingual.json")
         save_json(bilingual_data, bilingual_path)
 
-        # 6. Write Vietnamese subtitle preview
-        vi_srt_path = self._path(
-            "subtitles_dir",
-            f"{video_stem}_vi.srt",
-        )
-        self.subtitle_writer.write_vietnamese_srt(
-            translated_segments,
-            vi_srt_path,
-        )
+        vi_srt_path = self._path("subtitles_dir", f"{video_stem}_vi.srt")
+        self.subtitle_writer.write_vietnamese_srt(translated_segments, vi_srt_path)
 
         return {
             "stage": "translation_prepared",
@@ -220,17 +158,8 @@ class VideoLocalizationPipeline:
         subtitle_style: Dict[str, Any] | None = None,
         subtitle_max_chars_per_line: int | None = None,
     ) -> Dict[str, Any]:
-        """
-        Tạo video đầu ra từ file bilingual JSON.
-
-        audio_mode:
-        - replace: tạo TTS, thay audio gốc bằng audio tiếng Việt.
-        - mix_low_original: tạo TTS, giữ audio gốc nhỏ và trộn giọng Việt.
-        - subtitle_only: không tạo TTS, giữ audio gốc và chỉ chèn phụ đề tiếng Việt.
-        """
         bilingual_path = Path(bilingual_path)
         bilingual_data = load_json(bilingual_path)
-
         video_name = bilingual_data["video_name"]
         video_stem = bilingual_data.get("video_stem") or Path(video_name).stem
         video_duration = float(bilingual_data["video_duration_sec"])
@@ -238,32 +167,20 @@ class VideoLocalizationPipeline:
         translated_segments = bilingual_data["segments"]
 
         render_cfg = self.config.get("render", {})
-
         audio_mode = audio_mode or render_cfg.get("audio_mode", "replace")
-
-        burn_subtitle = (
-            bool(burn_subtitle)
-            if burn_subtitle is not None
-            else bool(render_cfg.get("burn_subtitle", False))
-        )
-
+        burn_subtitle = bool(burn_subtitle) if burn_subtitle is not None else bool(render_cfg.get("burn_subtitle", False))
         original_audio_volume_db = (
             float(original_audio_volume_db)
             if original_audio_volume_db is not None
             else float(render_cfg.get("original_audio_volume_db", -18.0))
         )
-
         subtitle_max_chars_per_line = (
             int(subtitle_max_chars_per_line)
             if subtitle_max_chars_per_line is not None
             else int(render_cfg.get("subtitle_max_chars_per_line", 42))
         )
 
-        vi_srt_path = self._path(
-            "subtitles_dir",
-            f"{video_stem}_vi.srt",
-        )
-
+        vi_srt_path = self._path("subtitles_dir", f"{video_stem}_vi.srt")
         self.subtitle_writer.write_vietnamese_srt(
             translated_segments,
             vi_srt_path,
@@ -281,12 +198,7 @@ class VideoLocalizationPipeline:
                 burn_subtitle=True,
                 subtitle_style=subtitle_style,
             )
-
-            output_subtitle_path = self.renderer.copy_subtitle_to_output(
-                subtitle_path=vi_srt_path,
-                video_stem=video_stem,
-            )
-
+            output_subtitle_path = self.renderer.copy_subtitle_to_output(vi_srt_path, video_stem)
             return {
                 "stage": "render_finished",
                 "video_name": video_name,
@@ -305,11 +217,9 @@ class VideoLocalizationPipeline:
                 "original_audio_volume_db": original_audio_volume_db,
                 "subtitle_style": subtitle_style,
                 "subtitle_max_chars_per_line": subtitle_max_chars_per_line,
-                "note": "Subtitle-only mode: original audio preserved, Vietnamese subtitle burned into video.",
             }
 
         use_smart_cache = not clear_tts_cache
-
         if clear_tts_cache:
             tts_dir = self._path("tts_segments_dir", video_stem)
             if tts_dir.exists():
@@ -320,11 +230,7 @@ class VideoLocalizationPipeline:
             video_stem=video_stem,
             use_smart_cache=use_smart_cache,
         )
-
-        tts_data_path = self._path(
-            "transcripts_dir",
-            f"{video_stem}_tts_segments.json",
-        )
+        tts_data_path = self._path("transcripts_dir", f"{video_stem}_tts_segments.json")
         save_json(tts_segments, tts_data_path)
 
         dubbed_audio_path = self.audio_aligner.build_dubbed_audio(
@@ -332,7 +238,6 @@ class VideoLocalizationPipeline:
             video_duration_sec=video_duration,
             video_stem=video_stem,
         )
-
         output_video_path = self.renderer.render_localized_video(
             input_video_path=input_video_path,
             dubbed_audio_path=dubbed_audio_path,
@@ -343,11 +248,7 @@ class VideoLocalizationPipeline:
             burn_subtitle=burn_subtitle,
             subtitle_style=subtitle_style,
         )
-
-        output_subtitle_path = self.renderer.copy_subtitle_to_output(
-            subtitle_path=vi_srt_path,
-            video_stem=video_stem,
-        )
+        output_subtitle_path = self.renderer.copy_subtitle_to_output(vi_srt_path, video_stem)
 
         return {
             "stage": "render_finished",
@@ -370,26 +271,9 @@ class VideoLocalizationPipeline:
         }
 
     def process_video(self, video_path: str | Path) -> Dict[str, Any]:
-        """
-        CLI mode: chạy full pipeline tự động.
-
-        Streamlit nên dùng:
-        - prepare_translation()
-        - render_from_bilingual()
-
-        để có bước sửa bản dịch trước TTS.
-        """
         prepared = self.prepare_translation(video_path)
-
-        rendered = self.render_from_bilingual(
-            prepared["bilingual_transcript_path"],
-            clear_tts_cache=True,
-        )
-
-        return {
-            **prepared,
-            **rendered,
-        }
+        rendered = self.render_from_bilingual(prepared["bilingual_transcript_path"], clear_tts_cache=True)
+        return {**prepared, **rendered}
 
 
 if __name__ == "__main__":
@@ -397,17 +281,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run video localization pipeline")
     parser.add_argument("--video", required=True, help="Path to input video")
-    parser.add_argument(
-        "--config",
-        default="configs/config.yaml",
-        help="Path to config.yaml",
-    )
-
+    parser.add_argument("--config", default="configs/config.yaml", help="Path to config.yaml")
     args = parser.parse_args()
 
     pipeline = VideoLocalizationPipeline(config_path=args.config)
     result = pipeline.process_video(args.video)
-
     print("=== Pipeline finished ===")
     for key, value in result.items():
         print(f"{key}: {value}")
