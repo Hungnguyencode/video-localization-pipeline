@@ -1,41 +1,39 @@
-# Hướng dẫn chạy demo
+# RUN_DEMO.md
 
-## 1. Cài FFmpeg
+# Hướng dẫn chạy demo Video Localization Pipeline
 
-Cần cài FFmpeg và thêm vào PATH.
+## 1. Kích hoạt virtual environment
+```bash
+venv\Scripts\activate  # Windows
+# source venv/bin/activate  # macOS/Linux
+```
 
-Kiểm tra:
-
-```powershell
-ffmpeg -version
-ffprobe -version
-2. Tạo môi trường ảo
-python -m venv venv
-.\venv\Scripts\activate
-python -m pip install --upgrade pip
-3. Cài PyTorch GPU
-
-Với NVIDIA GPU, có thể cài bản CUDA 12.1:
-
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-Nếu lỗi GPU, có thể cài CPU hoặc để faster-whisper fallback CPU.
-
-4. Cài thư viện
-pip install -r requirements.txt
-5. Chạy bằng command line
-python main_pipeline.py --video "data/input/demo.mp4"
-6. Chạy giao diện Streamlit
+## 2. Chạy Streamlit App
+```bash
 streamlit run app/streamlit_app.py
-7. Kết quả đầu ra
+```
 
-Sau khi chạy, kết quả nằm trong:
+## 3. Giao diện web
+- Chọn **glossary** theo lĩnh vực.
+- Upload video hoặc nhập **YouTube URL**.
+- Nhấn **Bước 1: Tạo transcript + bản dịch**.
 
-data/output/
+## 4. Kiểm tra và chỉnh sửa transcript
+- **Tab Bảng dịch**: xem toàn bộ segment, chỉnh sửa text/voice/rate.
+- **Tab Sửa / tách / phân vai**: gán speaker, merge/tách segment.
+- **Tab Kiểm tra chất lượng**: xem cảnh báo về TTS và độ dài segment.
 
-Bao gồm:
+## 5. Xuất video và SRT
+- **Tab Tạo lồng tiếng/video**: chọn giọng mặc định, tốc độ, audio mode.
+- Nhấn **Bước 2: Tạo video từ bản đã chỉnh**.
+- File đầu ra:
+  - Video
+  - File SRT tự động căn chỉnh: `data/transcripts/{video_stem}_auto_fitted.srt`
+  - JSON transcript
+  - Report HTML/JSON
 
-video đã lồng tiếng tiếng Việt;
-phụ đề tiếng Việt .srt;
-transcript song ngữ;
-audio lồng tiếng.
+## 6. Lưu ý
+- Không push video/audio lớn lên GitHub.
+- `.env` chứa API key riêng nên không push.
+- Có thể chỉnh `chars_per_sec` trong code nếu muốn tốc độ TTS nhanh/chậm.
+- Tab Quality check nên kiểm tra trước khi render video để tránh TTS quá nhanh hoặc segment quá dài.
