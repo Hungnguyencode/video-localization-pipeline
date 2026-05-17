@@ -2,7 +2,53 @@
 
 # Video Localization Pipeline
 
-Project này giúp **việt hóa video ngắn**: tự động tạo transcript từ video, dịch sang tiếng Việt, chuẩn hóa segment, lồng TTS bằng Edge/FPT.AI, và xuất SRT + video đầu ra.
+# 🎬 Video Localization Pipeline
+
+## Mục đích
+Project này là một pipeline hoàn chỉnh để **việt hóa video ngắn**, bao gồm các bước:
+1. Tự động tạo transcript từ audio/video bằng **ASR (Whisper/FasterWhisper)**.
+2. Dịch sang tiếng Việt với **Gemini Translator**, có fallback sang Google Free hoặc Local HF nếu cần.
+3. Hậu xử lý tiếng Việt: chuẩn hóa, tách câu, chuyển số thành chữ.
+4. Gán voice/TTS (Edge hoặc FPT.AI) và tạo audio.
+5. Lồng tiếng, render video, chèn phụ đề và xuất báo cáo demo.
+
+Mục tiêu: giảm thời gian thủ công, giữ chất lượng audio/TTS và đảm bảo đồng bộ phụ đề.
+
+---
+
+## Chức năng chính
+
+### 1. Transcript & dịch
+- ASR segment tự động, merge các segment bị cắt lẻ.
+- Tích hợp **glossary theo domain** (Cooking, Education, News, Technology) để dịch chuẩn thuật ngữ.
+- Hỗ trợ quick replacements từ UI.
+
+### 2. Editor & postprocess
+- Xem, sửa, gán speaker/voice, rate cho từng segment.
+- Split/merge segment linh hoạt.
+- Kiểm tra chất lượng TTS:
+  - Segment dài/short.
+  - Chữ nhiều quá so với thời lượng.
+  - Kiểm tra dấu câu, chữ thường đầu câu, số tách sai.
+  
+### 3. TTS & Audio
+- Tích hợp **Edge TTS** và **FPT.AI TTS**.
+- Chạy đồng thời voice/rate cache, fallback khi lỗi FPT.
+- Chuẩn hóa audio, trim silence, speedup segment dài.
+
+### 4. Render Video & Subtitle
+- Render video với audio lồng tiếng.
+- Chèn phụ đề tiếng Việt (burn-in) hoặc xuất SRT.
+- Tùy chỉnh font, size, outline, margin.
+- Output đầy đủ: video, SRT, JSON, report HTML/JSON.
+
+### 5. Báo cáo & kiểm tra
+- Báo cáo demo chi tiết:
+  - Số segment, số đã chỉnh, cảnh báo chất lượng.
+  - Thống kê voice, rate, speaker.
+  - Link download video/SRT/JSON/report.
+
+---
 
 ## Cấu trúc project
 ```
@@ -11,11 +57,17 @@ video-localization-pipeline/
 │   └── streamlit_app.py
 ├── src/
 │   ├── tts/
-│   ├── translation/
+│   ├── alignment/
+│   ├── asr/
+│   ├── audio/
+│   ├── ingest/
 │   ├── subtitle/
 │   └── utils/
 ├── data/
 │   ├── input/
+│   ├── output/
+│   ├── audio/
+│   ├── cache/
 │   ├── transcripts/
 │   └── tts_segments/
 ├── configs/
@@ -53,43 +105,27 @@ FPT_AI_API_KEY=your_fpt_ai_api_key_here
 - Xuất video đầu ra và file SRT đã căn chỉnh timestamp
 - Kiểm tra chất lượng segment (Cảnh báo dài, TTS nhanh, segment cắt cụt...)
 
+
 ---
 
-# RUN_DEMO.md
+## Điểm mạnh
+- **Full pipeline:** ASR → dịch → TTS → render video.
+- **Multi-TTS provider:** Edge + FPT.AI, có fallback.
+- **Human-in-the-loop:** sửa segment, gán voice, rate.
+- **Chất lượng cao:** kiểm tra TTS, kiểm tra dấu câu, cảnh báo segment dài.
+- **Flexible:** merge/split segment, glossary domain, quick replacements.
+- **Export đa dạng:** video, SRT, JSON, report HTML/JSON.
 
-# Hướng dẫn chạy demo Streamlit
+## Điểm hạn chế
+- **Tốc độ FPT chậm**, cần cache audio.
+- **Gemini API có hạn mức**, fallback sang Google/Local.
+- **Segment merge chưa tự động hoàn toàn**, vẫn cần kiểm tra manual.
+- **Yêu cầu môi trường:** FFmpeg, Python >=3.10, GPU nếu dùng model Whisper lớn.
 
-1. Kích hoạt virtual environment
-```bash
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # macOS/Linux
-```
+---
 
-2. Chạy Streamlit app
-```bash
-streamlit run app/streamlit_app.py
-```
+## License
+MIT License
 
-3. Trình duyệt sẽ mở giao diện web:
-- Chọn **glossary** theo lĩnh vực
-- Upload video hoặc nhập **YouTube URL**
-- Nhấn **Bước 1: Tạo transcript + bản dịch**
-
-4. Kiểm tra và chỉnh sửa:
-- Tab **Bảng dịch**: xem toàn bộ segment, chỉnh sửa text/voice/rate
-- Tab **Sửa / tách / phân vai**: gán speaker, merge/tách segment
-- Tab **Kiểm tra chất lượng**: xem cảnh báo về TTS
-
-5. Tạo video/SRT:
-- Tab **Tạo lồng tiếng/video**
-- Chọn giọng mặc định, tốc độ, audio mode
-- Nhấn **Bước 2: Tạo video từ bản đã chỉnh**
-- File đầu ra gồm video, SRT tự động căn chỉnh, JSON transcript, report HTML/JSON
-
-6. File SRT tự động xuất ra: `data/transcripts/{video_stem}_auto_fitted.srt`
-
-## Lưu ý
-- Không push video/audio lớn lên GitHub
-- `.env` chứa API key riêng nên không push
-- Tùy chỉnh `chars_per_sec` trong code nếu muốn tốc độ TTS nhanh/chậm
+---
 
