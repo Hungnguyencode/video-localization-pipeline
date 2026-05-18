@@ -68,19 +68,20 @@ class VietnamesePostProcessor:
         text = self._fix_number_separators(text)
         text = re.sub(r"\s+", " ", text)
 
-        # Xóa khoảng trắng trước dấu câu, nhưng không phá số 13.000.
+        # Dọn lỗi dấu câu thừa: ",.", ",!", ";."...
+        text = re.sub(r"\s*([,;:])\s*([.!?])", r"\2", text)
+
+        # Dọn lặp dấu kết câu: "..", "!!", ".!"
+        text = re.sub(r"([.!?])\s*([.!?])+", r"\1", text)
+
+        # Xóa khoảng trắng trước dấu câu.
         text = re.sub(r"(?<!\d)\s+([,.!?;:])", r"\1", text)
 
-        # Thêm khoảng trắng sau dấu câu, nhưng không thêm vào giữa số 13.000.
+        # Thêm khoảng trắng sau dấu câu, nhưng không phá số 13.000.
         text = re.sub(r"([,.!?;:])(?!\d)([^\s])", r"\1 \2", text)
 
         text = self._fix_number_separators(text)
         text = re.sub(r"\s+", " ", text)
-
-        # Dọn lỗi dấu câu thừa hay gặp sau dịch/merge.
-        text = text.replace(",.", ".")
-        text = text.replace(" ,", ",")
-        text = text.replace(" .", ".")
 
         return text.strip()
 

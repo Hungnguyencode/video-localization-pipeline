@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -35,7 +36,7 @@ from src.translation.glossary_loader import (
     parse_quick_replacements,
 )
 from src.utils.io import load_json, save_json
-
+from src.alignment.tts_alignment_report import build_tts_alignment_report
 
 st.set_page_config(
     page_title="Video Localization Pipeline",
@@ -43,6 +44,23 @@ st.set_page_config(
     layout="wide",
 )
 
+import json
+from pathlib import Path
+
+def cache_step(file_path, data=None):
+    file_path = Path(file_path)
+
+    if data is None:
+        if file_path.exists():
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return None
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+from src.translation.translator import PROMPT_VERSION
 
 # =========================
 # Options
@@ -223,6 +241,37 @@ def save_glossary_metadata_to_bilingual(
     }
     save_json(data, bilingual_path)
 
+def file_sha1_short(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    path = Path(path)
+    h = hashlib.sha1()
+
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+
+    return h.hexdigest()[:16]
+
+def build_prepare_cache_key(
+    video_stem: str,
+    selected_domain: str,
+    glossary_files: list[str],
+    replacements: list,
+    model_name: str,
+    input_file_hash: str,
+    prompt_version: str,
+) -> str:
+    payload = {
+        "video_stem": video_stem,
+        "input_file_hash": input_file_hash,
+        "domain": selected_domain,
+        "glossary_files": glossary_files,
+        "replacements": replacements,
+        "model_name": model_name,
+        "prompt_version": prompt_version,
+        "cache_version": "prepare_v4_domain_glossary_prompt_context",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 def download_youtube_to_input(url: str, max_height: int) -> Dict[str, Any]:
     input_dir = PROJECT_ROOT / "data" / "input"
@@ -245,6 +294,73 @@ def estimate_tts_risk(text: str, duration_sec: float) -> tuple[str, float]:
         return "Hơi dài", chars_per_sec
     return "Quá dài", chars_per_sec
 
+import re
+
+def auto_adjust_rate(text: str, duration_sec: float) -> str:
+    text = str(text or "").strip()
+    duration_sec = max(float(duration_sec), 0.1)
+
+    cps = len(text) / duration_sec
+
+    if cps <= 14:
+        return "+0%"
+    elif cps <= 18:
+        return "+10%"
+    elif cps <= 22:
+        return "+15%"
+    else:
+        return "+20%"
+
+
+def auto_split_text(text: str, max_len: int = 90) -> list[str]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+
+    if len(text) <= max_len:
+        return [text]
+
+    sentence_parts = re.split(r"(?<=[,.!?;:])\s+", text)
+    chunks: list[str] = []
+    current = ""
+
+    def push_current():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for part in sentence_parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Nếu một câu vẫn quá dài, tách tiếp theo khoảng trắng.
+        if len(part) > max_len:
+            push_current()
+            words = part.split()
+            tmp = ""
+            for word in words:
+                candidate = f"{tmp} {word}".strip()
+                if len(candidate) <= max_len or not tmp:
+                    tmp = candidate
+                else:
+                    chunks.append(tmp.strip())
+                    tmp = word
+            if tmp.strip():
+                chunks.append(tmp.strip())
+            continue
+
+        candidate = f"{current} {part}".strip()
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            push_current()
+            current = part
+
+    push_current()
+    return chunks
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -252,6 +368,22 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+def clean_vi_text_for_output(text: str) -> str:
+    text = str(text or "").strip()
+    text = re.sub(r"\s+", " ", text)
+
+    # Dọn lỗi kiểu ",.", ",!", dấu câu sát chữ...
+    text = re.sub(r"\s*([,;:])\s*([.!?])", r"\2", text)
+    text = re.sub(r"([.!?])\s*([.!?])+", r"\1", text)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"([,.!?;:])(?!\d)([^\s])", r"\1 \2", text)
+
+    text = text.strip()
+
+    if text and text[-1] not in ".!?…":
+        text += "."
+
+    return text
 
 def build_editor_dataframe(bilingual_data: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -260,14 +392,25 @@ def build_editor_dataframe(bilingual_data: Dict[str, Any]) -> pd.DataFrame:
         end = _safe_float(item.get("end"), start + 0.1)
         duration = max(end - start, 0.1)
         vi_text = str(item.get("vi_text", "") or "")
+
+        # ✅ tính lại risk
         risk, cps = estimate_tts_risk(vi_text, duration)
+
+        # ✅ AUTO RATE
+        saved_rate_label = item.get("rate_label")
+        saved_rate_value = item.get("rate") or item.get("tts_rate")
+
+        if saved_rate_label or saved_rate_value:
+            rate_label = canonical_rate_label(saved_rate_label, saved_rate_value)
+        else:
+            rate_value = auto_adjust_rate(vi_text, duration)
+            rate_label = RATE_REVERSE_OPTIONS.get(rate_value, DEFAULT_RATE_LABEL)
+
+        rate_manual = bool(item.get("rate_manual", False))
 
         voice_value = item.get("voice") or item.get("tts_voice") or DEFAULT_VOICE_VALUE
         voice_label = item.get("voice_label") or get_voice_label(voice_value)
         voice_label = canonical_voice_label(voice_label)
-
-        rate_value = item.get("rate") or item.get("tts_rate") or DEFAULT_RATE_VALUE
-        rate_label = canonical_rate_label(item.get("rate_label"), rate_value)
 
         speaker_role = str(item.get("speaker_role") or "Mặc định")
         if speaker_role not in SPEAKER_ROLE_OPTIONS:
@@ -287,7 +430,7 @@ def build_editor_dataframe(bilingual_data: Dict[str, Any]) -> pd.DataFrame:
                 "voice_manual": bool(item.get("voice_manual", False)),
                 "rate_label": rate_label,
                 "rate": get_rate_value(rate_label),
-                "rate_manual": bool(item.get("rate_manual", False)),
+                "rate_manual": rate_manual,
                 "source_text": item.get("source_text") or item.get("text") or "",
                 "raw_vi_text": item.get("raw_vi_text", item.get("vi_text", "")),
                 "vi_text": vi_text,
@@ -401,6 +544,75 @@ def split_text_suggestion(text: str) -> tuple[str, str]:
         cut = mid
     return text[:cut].strip(), text[cut:].strip()
 
+def auto_split_long_segments_df(
+    df: pd.DataFrame,
+    max_duration: float = 12.0,
+    max_chars: int = 220,
+) -> pd.DataFrame:
+    output_rows: list[dict[str, Any]] = []
+
+    for _, row in normalize_editor_dataframe(df).iterrows():
+        duration = _safe_float(row.get("duration"), 0.0)
+        vi_text = str(row.get("vi_text", "")).strip()
+
+        if duration <= max_duration and len(vi_text) <= max_chars:
+            output_rows.append(row.to_dict())
+            continue
+
+        # Ước lượng số phần cần tách.
+        duration_parts = int(duration // max_duration) + (1 if duration % max_duration > 0 else 0)
+        char_parts = int(len(vi_text) // max_chars) + (1 if len(vi_text) % max_chars > 0 else 0)
+        target_parts = max(2, duration_parts, char_parts)
+
+        target_len = max(45, int(len(vi_text) / target_parts) + 15)
+        parts = auto_split_text(vi_text, max_len=target_len)
+
+        # Nếu câu ít dấu câu quá, ép tách bằng split_text_suggestion.
+        while len(parts) < target_parts and any(len(p) > target_len for p in parts):
+            new_parts = []
+            changed = False
+            for p in parts:
+                if len(p) > target_len:
+                    p1, p2 = split_text_suggestion(p)
+                    if p1 and p2 and p1 != p2:
+                        new_parts.extend([p1, p2])
+                        changed = True
+                    else:
+                        new_parts.append(p)
+                else:
+                    new_parts.append(p)
+            parts = new_parts
+            if not changed:
+                break
+
+        if len(parts) <= 1:
+            output_rows.append(row.to_dict())
+            continue
+
+        start = _safe_float(row.get("start"), 0.0)
+        end = _safe_float(row.get("end"), start + duration)
+        total_chars = max(sum(len(p) for p in parts), 1)
+        cursor = start
+
+        for idx, part in enumerate(parts):
+            new_row = row.copy()
+            ratio = len(part) / total_chars
+
+            if idx == len(parts) - 1:
+                part_end = end
+            else:
+                part_end = cursor + duration * ratio
+
+            new_row["start"] = round(cursor, 2)
+            new_row["end"] = round(part_end, 2)
+            new_row["duration"] = round(part_end - cursor, 2)
+            new_row["vi_text"] = part.strip()
+            new_row["raw_vi_text"] = part.strip()
+
+            output_rows.append(new_row.to_dict())
+            cursor = part_end
+
+    return normalize_editor_dataframe(pd.DataFrame(output_rows))
 
 def apply_voice_to_segment_ranges(range_text: str, voice_label: str, speaker_role: str = "Tùy chỉnh") -> int:
     df = st.session_state.get("editor_df")
@@ -464,6 +676,73 @@ def update_segment_rate(segment_id: int, rate_label: str, manual: bool = True) -
         st.session_state["editor_df"].loc[mask, "rate_manual"] = bool(manual)
         st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
 
+def apply_alignment_rate_fixes_from_report(
+    alignment_report_json_path: str | None,
+    min_positive_offset_sec: float = 0.25,
+) -> int:
+    """
+    Level 3B: tự áp dụng suggested_rate cho các segment có TTS dài hơn subtitle.
+
+    Chỉ xử lý offset_sec > min_positive_offset_sec.
+    Không xử lý TTS ngắn hơn vì không gây đè audio.
+    """
+    if not alignment_report_json_path:
+        return 0
+
+    report_path = Path(alignment_report_json_path)
+
+    if not report_path.exists():
+        return 0
+
+    df = st.session_state.get("editor_df")
+
+    if df is None or df.empty:
+        return 0
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    rows = report.get("rows", [])
+
+    changed_count = 0
+
+    for row in rows:
+        segment_id = int(row.get("segment_id", 0) or 0)
+        offset_sec = _safe_float(row.get("offset_sec"), 0.0)
+
+        # Chỉ auto-fix khi TTS dài hơn subtitle
+        if offset_sec <= min_positive_offset_sec:
+            continue
+
+        suggested_rate = str(row.get("suggested_rate") or "").strip()
+
+        if not suggested_rate:
+            continue
+
+        suggested_rate_label = RATE_REVERSE_OPTIONS.get(suggested_rate)
+
+        if not suggested_rate_label:
+            continue
+
+        mask = st.session_state["editor_df"]["segment_id"].astype(int) == segment_id
+
+        if not mask.any():
+            continue
+
+        old_rate = str(st.session_state["editor_df"].loc[mask, "rate"].iloc[0])
+
+        if old_rate == suggested_rate:
+            continue
+
+        st.session_state["editor_df"].loc[mask, "rate"] = suggested_rate
+        st.session_state["editor_df"].loc[mask, "rate_label"] = suggested_rate_label
+        st.session_state["editor_df"].loc[mask, "rate_manual"] = True
+
+        changed_count += 1
+
+    if changed_count > 0:
+        st.session_state["editor_df"] = normalize_editor_dataframe(st.session_state["editor_df"])
+        st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+
+    return changed_count
 
 def merge_segment_ranges(range_text: str, voice_strategy: str = "first") -> int:
     df = st.session_state.get("editor_df")
@@ -613,8 +892,8 @@ def save_edited_bilingual(bilingual_path: str | Path, edited_df: pd.DataFrame) -
     edited_segments = []
     for _, row in normalized_df.iterrows():
         source_text = str(row.get("source_text", "")).strip()
-        raw_vi_text = str(row.get("raw_vi_text", "")).strip()
-        vi_text = str(row.get("vi_text", "")).strip()
+        vi_text = clean_vi_text_for_output(row.get("vi_text", ""))
+        raw_vi_text = clean_vi_text_for_output(row.get("raw_vi_text", vi_text))
         voice_label = canonical_voice_label(row.get("voice_label"))
         rate_label = canonical_rate_label(row.get("rate_label"), row.get("rate"))
         start = _safe_float(row.get("start"), 0.0)
@@ -667,7 +946,7 @@ def quality_check_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         source = str(row.get("source_text", "")).strip()
         def add(level: str, issue: str, suggestion: str):
             rows.append({"segment_id": sid, "level": level, "issue": issue, "suggestion": suggestion})
-        if duration >= 16:
+        if duration >= 12:
             add("Cảnh báo", f"Segment dài {duration:.1f}s", "Nên tách segment để dễ gán giọng và giảm đùn audio.")
         if cps > 23:
             add("Nặng", f"TTS rất dài: {cps:.1f} ký tự/s", "Rút gọn câu hoặc bật auto speed +20%.")
@@ -720,6 +999,14 @@ def create_demo_report(
         "output_video_path": render_result.get("output_video_path"),
         "output_subtitle_path": render_result.get("output_subtitle_path"),
         "bilingual_transcript_path": render_result.get("bilingual_transcript_path"),
+        
+        #Level 3A/3B
+        "tts_alignment_summary": render_result.get("tts_alignment_summary"),
+        "tts_alignment_report_json_path": render_result.get("tts_alignment_report_json_path"),
+        "tts_alignment_report_csv_path": render_result.get("tts_alignment_report_csv_path"),
+        "auto_fix_alignment_enabled": render_result.get("auto_fix_alignment_enabled"),
+        "auto_fix_alignment_changed_count": render_result.get("auto_fix_alignment_changed_count"),
+
     }
     json_path = output_dir / f"{video_stem}_demo_report.json"
     html_path = output_dir / f"{video_stem}_demo_report.html"
@@ -811,7 +1098,34 @@ def run_prepare_translation(input_path: Path, selected_domain: str, selected_glo
                 glossary_files=selected_glossary_files,
                 quick_replacement_text=quick_replacement_text,
             )
-            prepare_result = pipeline.prepare_translation(input_path)
+            translator = getattr(pipeline, "translator", None)
+            model_name = getattr(translator, "model_name", "unknown")
+
+            cache_key = build_prepare_cache_key(
+                video_stem=input_path.stem,
+                selected_domain=selected_domain,
+                glossary_files=selected_glossary_files,
+                replacements=runtime_replacements,
+                model_name=model_name,
+                input_file_hash=file_sha1_short(input_path),
+                prompt_version=PROMPT_VERSION,
+            )
+
+            cache_path = PROJECT_ROOT / "data" / "cache" / f"{input_path.stem}_translation_{cache_key}.json"
+            bilingual_cache_path = PROJECT_ROOT / "data" / "transcripts" / f"{input_path.stem}_bilingual_{cache_key}.json"
+
+            cached = cache_step(cache_path)
+
+            if cached and Path(cached.get("bilingual_transcript_path", "")).exists():
+                prepare_result = cached
+            else:
+                prepare_result = pipeline.prepare_translation(input_path)
+
+                bilingual_data_to_cache = load_json(prepare_result["bilingual_transcript_path"])
+                save_json(bilingual_data_to_cache, bilingual_cache_path)
+
+                prepare_result["bilingual_transcript_path"] = str(bilingual_cache_path)
+                cache_step(cache_path, prepare_result)
             save_glossary_metadata_to_bilingual(
                 bilingual_path=prepare_result["bilingual_transcript_path"],
                 domain_name=selected_domain,
@@ -1159,12 +1473,30 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
 
     with tab_quality:
         st.markdown("#### Kiểm tra chất lượng trước khi render")
+
         qdf = quality_check_dataframe(st.session_state["editor_df"])
+
         if qdf.empty:
             st.success("Không phát hiện cảnh báo đáng kể.")
         else:
             st.dataframe(qdf, width="stretch", height=420)
-            st.caption("Các cảnh báo này không chặn render, nhưng nên xử lý các dòng 'Nặng' và 'Cảnh báo' trước khi demo.")
+            st.caption(
+                "Các cảnh báo này không chặn render, nhưng nên xử lý các dòng "
+                "'Nặng' và 'Cảnh báo' trước khi demo."
+            )
+
+        st.markdown("#### Sửa nhanh segment dài")
+
+        if st.button("Tự động tách các segment quá dài", width="stretch", key="auto_split_long_segments"):
+            st.session_state["editor_df"] = auto_split_long_segments_df(
+                st.session_state["editor_df"],
+                max_duration=12.0,
+                max_chars=220,
+            )
+            st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+            st.success("Đã tự động tách các segment dài. Hãy kiểm tra lại bảng editor.")
+            st.rerun()
+
 
     with tab_render:
         st.markdown("#### Cấu hình lồng tiếng/video")
@@ -1175,6 +1507,15 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
         with col_rate:
             default_rate_label = st.selectbox("Tốc độ mặc định", options=list(RATE_OPTIONS.keys()), index=3, help="Video news thường nói nhanh, nên thử +15% hoặc +20%.")
             auto_rate_enabled = st.checkbox("Tự động chỉnh tốc độ theo từng segment", value=True, help="Segment dài sẽ tự dùng +10%, +15% hoặc +20% nếu chưa chỉnh rate thủ công.")
+            auto_fix_alignment_enabled = st.checkbox(
+                "Tự động auto-fix TTS dài trước khi xuất video",
+                value=True,
+                help=(
+                    "Hệ thống sẽ render/TTS kiểm tra trước, đo lệch audio, "
+                    "tự tăng rate cho segment bị TTS dài hơn subtitle, rồi render lại video cuối. "
+                    "Người dùng chỉ cần bấm render một lần."
+                ),
+            )
 
         st.markdown("#### Chế độ render video")
         col_audio_mode, col_original_volume = st.columns(2)
@@ -1221,6 +1562,14 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
             ),
         )
         st.warning("Khi render, hệ thống sẽ dùng bản dịch/segment/voice/rate hiện tại. Xem tab Quality check trước nếu muốn demo mượt.")
+        qdf_before_render = quality_check_dataframe(st.session_state["editor_df"])
+        heavy_count = int((qdf_before_render["level"] == "Nặng").sum()) if not qdf_before_render.empty else 0
+        warning_count = int((qdf_before_render["level"] == "Cảnh báo").sum()) if not qdf_before_render.empty else 0
+
+        allow_render_with_warnings = st.checkbox(
+            "Vẫn render dù còn lỗi/cảnh báo",
+            value=False,
+        )
 
         col_save, col_render = st.columns(2)
         if col_save.button("Lưu bản dịch đã chỉnh", width="stretch"):
@@ -1241,6 +1590,12 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                 st.exception(e)
 
         if col_render.button("Bước 2: Tạo video từ bản đã chỉnh", type="primary", width="stretch"):
+            if (heavy_count > 0 or warning_count > 0) and not allow_render_with_warnings:
+                st.warning(
+                    f"Còn {heavy_count} lỗi nặng và {warning_count} cảnh báo. "
+                    "Nên sửa hoặc tách segment trước khi render."
+                )
+                st.stop()
             try:
                 role_voice_map_render = build_role_voice_map(st.session_state.get("role_a_voice", "Nữ - HoaiMy"), st.session_state.get("role_b_voice", "Nam - NamMinh"), st.session_state.get("role_c_voice", "Nữ - HoaiMy"))
                 render_df = build_render_dataframe(
@@ -1257,6 +1612,10 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                     pipeline = get_pipeline()
                     pipeline.tts_engine.voice = get_voice_value(default_voice_label)
                     pipeline.tts_engine.rate = get_rate_value(default_rate_label)
+                    # =====================================================
+                    # Level 3B auto-fix trong 1 lần bấm render
+                    # Pass 1: render/TTS để đo duration audio
+                    # =====================================================
                     render_result = pipeline.render_from_bilingual(
                         edited_path,
                         clear_tts_cache=clear_cache,
@@ -1266,6 +1625,94 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                         subtitle_style=subtitle_style,
                         subtitle_max_chars_per_line=subtitle_max_chars_per_line,
                     )
+
+                    auto_fix_changed_count = 0
+                    tts_segments_path = render_result.get("tts_segments_path")
+
+                    if selected_audio_mode != "subtitle_only" and tts_segments_path:
+                        alignment_report = build_tts_alignment_report(
+                            bilingual_path=edited_path,
+                            tts_root=PROJECT_ROOT / "data" / "tts_segments",
+                            output_dir=PROJECT_ROOT / "data" / "output",
+                            video_stem=video_stem,
+                            tts_segments_path=tts_segments_path,
+                        )
+                    else:
+                        alignment_report = {
+                            "summary": {},
+                            "report_json_path": None,
+                            "report_csv_path": None,
+                            "rows": [],
+                        }
+
+                    auto_fix_enabled_for_this_render = (
+                        auto_fix_alignment_enabled
+                        and selected_audio_mode != "subtitle_only"
+                        and bool(tts_segments_path)
+                    )
+
+                    # =====================================================
+                    # Nếu bật auto-fix:
+                    # - đọc alignment report
+                    # - tự tăng rate cho segment TTS dài hơn subtitle
+                    # - lưu lại bilingual edited
+                    # - render lại lần 2 để xuất video cuối
+                    # =====================================================
+                    if auto_fix_enabled_for_this_render:
+                        auto_fix_changed_count = apply_alignment_rate_fixes_from_report(
+                            alignment_report_json_path=alignment_report["report_json_path"],
+                            min_positive_offset_sec=0.25,
+                        )
+
+                        if auto_fix_changed_count > 0:
+                            print(
+                                f"[ALIGN][AUTO_FIX] Applied rate fix for "
+                                f"{auto_fix_changed_count} segment(s). Re-rendering final video..."
+                            )
+
+                            # Build lại dataframe sau khi rate đã được auto-fix
+                            render_df = build_render_dataframe(
+                                st.session_state["editor_df"],
+                                default_voice_label,
+                                default_rate_label,
+                                VOICE_RENDER_MODE_OPTIONS[voice_render_mode_label],
+                                auto_rate_enabled,
+                                role_voice_map_render,
+                            )
+
+                            # Lưu lại bilingual đã fix rate
+                            edited_path = save_edited_bilingual(bilingual_path, render_df)
+                            st.session_state["edited_bilingual_path"] = edited_path
+
+                            # Pass 2: render lại video cuối với rate mới
+                            # Bắt buộc clear_tts_cache=True để audio được tạo lại theo rate mới
+                            render_result = pipeline.render_from_bilingual(
+                                edited_path,
+                                clear_tts_cache=True,
+                                audio_mode=selected_audio_mode,
+                                burn_subtitle=burn_subtitle,
+                                original_audio_volume_db=float(original_volume_db),
+                                subtitle_style=subtitle_style,
+                                subtitle_max_chars_per_line=subtitle_max_chars_per_line,
+                            )
+
+                            # Tạo lại alignment report cuối cùng
+                            alignment_report = build_tts_alignment_report(
+                                bilingual_path=edited_path,
+                                tts_root=PROJECT_ROOT / "data" / "tts_segments",
+                                output_dir=PROJECT_ROOT / "data" / "output",
+                                video_stem=video_stem,
+                                tts_segments_path=render_result.get("tts_segments_path"),
+                            )
+
+                    # Gắn alignment info vào render_result cuối
+                    render_result["tts_alignment_summary"] = alignment_report["summary"]
+                    render_result["tts_alignment_report_json_path"] = alignment_report["report_json_path"]
+                    render_result["tts_alignment_report_csv_path"] = alignment_report["report_csv_path"]
+
+                    # Level 3B metadata
+                    render_result["auto_fix_alignment_enabled"] = bool(auto_fix_enabled_for_this_render)
+                    render_result["auto_fix_alignment_changed_count"] = int(auto_fix_changed_count)
                     render_result["selected_voice_label"] = default_voice_label
                     render_result["selected_voice"] = get_voice_value(default_voice_label)
                     render_result["selected_rate"] = get_rate_value(default_rate_label)
@@ -1302,22 +1749,77 @@ if "render_result" in st.session_state:
     col_info2.metric("Voice mặc định", result.get("selected_voice_label", get_voice_label(result.get("selected_voice"))))
     col_info3.metric("Rate", result.get("selected_rate", "-"))
     col_info4.metric("Audio mode", result.get("selected_audio_mode", result.get("audio_mode", "-")))
+    alignment_summary = result.get("tts_alignment_summary")
+
+    if alignment_summary:
+        st.markdown("### Level 3A - Kiểm tra đồng bộ TTS/audio")
+
+        a1, a2, a3, a4, a5 = st.columns(5)
+        a1.metric("OK", alignment_summary.get("ok_count", 0))
+        a2.metric("Lệch nhẹ", alignment_summary.get("light_offset_count", 0))
+        a3.metric("Lệch nặng", alignment_summary.get("heavy_offset_count", 0))
+        a4.metric("Thiếu audio", alignment_summary.get("missing_audio_count", 0))
+        a5.metric("Max offset", f"{alignment_summary.get('max_abs_offset_sec', 0)}s")
+
+        auto_fix_changed = int(result.get("auto_fix_alignment_changed_count", 0) or 0)
+        auto_fix_enabled = bool(result.get("auto_fix_alignment_enabled", False))
+
+        if auto_fix_enabled:
+            if auto_fix_changed > 0:
+                st.success(
+                    f"Level 3B đã tự auto-fix rate cho {auto_fix_changed} segment "
+                    "trong quá trình render."
+                )
+            else:
+                st.info(
+                    "Level 3B đã được bật, nhưng không có segment nào cần auto-fix rate "
+                    "hoặc các segment đã ở rate phù hợp."
+                )
+
+        if alignment_summary.get("heavy_offset_count", 0) > 0:
+            st.warning("Có segment lệch TTS/audio nặng. Nên kiểm tra file alignment CSV trước khi demo.")
+        elif alignment_summary.get("light_offset_count", 0) > 0:
+            st.info("Có một số segment lệch nhẹ. Video vẫn có thể dùng được, nhưng nên kiểm tra thêm.")
+        else:
+            st.success("Đồng bộ TTS/audio ổn. Không phát hiện lệch đáng kể.")
+
+
 
     st.markdown("### Video đầu ra")
     st.video(result["output_video_path"])
 
     st.markdown("### File đầu ra")
-    col_video, col_srt, col_json, col_report_json, col_report_html = st.columns(5)
+
+    col_video, col_srt, col_json, col_report_json, col_report_html, col_align_json, col_align_csv = st.columns(7)
+
     with col_video:
         show_download_button(result.get("output_video_path"), "Tải video", "video/mp4")
+
     with col_srt:
         show_download_button(result.get("output_subtitle_path"), "Tải .srt", "text/plain")
+
     with col_json:
         show_download_button(result.get("bilingual_transcript_path"), "Tải transcript JSON", "application/json")
+
     with col_report_json:
         show_download_button(result.get("report_json_path"), "Tải report JSON", "application/json")
+
     with col_report_html:
         show_download_button(result.get("report_html_path"), "Tải report HTML", "text/html")
+
+    with col_align_json:
+        show_download_button(
+            result.get("tts_alignment_report_json_path"),
+            "Tải align JSON",
+            "application/json",
+        )
+
+    with col_align_csv:
+        show_download_button(
+            result.get("tts_alignment_report_csv_path"),
+            "Tải align CSV",
+            "text/csv",
+        )
 
     with st.expander("Thông tin pipeline"):
         st.json(result)

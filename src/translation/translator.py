@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, List
@@ -10,6 +11,7 @@ from typing import Dict, List
 from dotenv import load_dotenv
 
 from src.translation.vi_postprocess import VietnamesePostProcessor, build_vi_postprocessor
+PROMPT_VERSION = "prompt_v3_news_tts"
 
 
 class BaseTranslator:
@@ -134,6 +136,9 @@ class GeminiTranslator(BaseTranslator):
         target_language: str = "vi",
         content_domain: str = "general",
         pronoun_style: str = "auto",
+        context_enabled: bool = True,
+        context_window: int = 1,
+        context_max_chars: int = 320,
         postprocessor: VietnamesePostProcessor | None = None,
     ):
         load_dotenv()
@@ -153,6 +158,12 @@ class GeminiTranslator(BaseTranslator):
         self.target_language = target_language
         self.content_domain = content_domain
         self.pronoun_style = pronoun_style
+
+        # Level 2: context-aware translation
+        self.context_enabled = bool(context_enabled)
+        self.context_window = max(int(context_window), 0)
+        self.context_max_chars = max(int(context_max_chars), 80)
+
         self.postprocessor = postprocessor
         self.cache: Dict[str, str] = self._load_cache()
 
@@ -186,6 +197,73 @@ class GeminiTranslator(BaseTranslator):
                 "Chưa cài thư viện Gemini. Hãy chạy: pip install google-generativeai"
             ) from exc
 
+    def _get_segment_source_text(self, segment: Dict) -> str:
+        """
+        Lấy text nguồn của segment theo nhiều key để tương thích pipeline.
+        """
+        return str(
+            segment.get("text")
+            or segment.get("source_text")
+            or segment.get("original_text")
+            or ""
+        ).strip()
+
+    def _clip_context_text(self, text: str, max_chars: int | None = None) -> str:
+        """
+        Cắt context để prompt không quá dài.
+        """
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        limit = max_chars or self.context_max_chars
+
+        if len(text) <= limit:
+            return text
+
+        # Giữ phần cuối vì thường sát với câu hiện tại hơn
+        return "..." + text[-limit:].strip()
+
+    def _build_context_for_index(self, segments: List[Dict], index: int) -> tuple[str, str]:
+        """
+        Lấy context trước/sau cho segment hiện tại.
+        """
+        if not self.context_enabled or self.context_window <= 0:
+            return "", ""
+
+        before_parts: List[str] = []
+        after_parts: List[str] = []
+
+        start_idx = max(0, index - self.context_window)
+        end_idx = min(len(segments), index + self.context_window + 1)
+
+        for i in range(start_idx, index):
+            text = self._get_segment_source_text(segments[i])
+            if text:
+                before_parts.append(text)
+
+        for i in range(index + 1, end_idx):
+            text = self._get_segment_source_text(segments[i])
+            if text:
+                after_parts.append(text)
+
+        context_before = self._clip_context_text(" ".join(before_parts))
+        context_after = self._clip_context_text(" ".join(after_parts))
+
+        return context_before, context_after
+
+    def _attach_context_to_segments(self, segments: List[Dict]) -> List[Dict]:
+        """
+        Tạo bản copy của segments và thêm context_before/context_after.
+        """
+        output: List[Dict] = []
+
+        for idx, segment in enumerate(segments):
+            new_segment = dict(segment)
+            context_before, context_after = self._build_context_for_index(segments, idx)
+            new_segment["context_before"] = context_before
+            new_segment["context_after"] = context_after
+            output.append(new_segment)
+
+        return output
+
     def _load_cache(self) -> Dict[str, str]:
         if not self.cache_enabled or not self.cache_path.exists():
             return {}
@@ -200,8 +278,23 @@ class GeminiTranslator(BaseTranslator):
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.cache_path.write_text(json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _cache_key(self, text: str) -> str:
-        raw = f"{self.model_name}|{self.content_domain}|{self.pronoun_style}|{text}"
+    def _cache_key(self, text: str, context_before: str = "", context_after: str = "") -> str:
+        """
+        Cache key có tính cả context.
+        Cùng một câu nhưng ngữ cảnh khác thì bản dịch có thể khác.
+        """
+        raw = "|".join(
+            [
+                str(self.model_name),
+                str(self.content_domain),
+                str(self.pronoun_style),
+                PROMPT_VERSION,
+                "context_v1",
+                str(text or ""),
+                str(context_before or ""),
+                str(context_after or ""),
+            ]
+        )
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _domain_instruction(self) -> str:
@@ -216,21 +309,41 @@ class GeminiTranslator(BaseTranslator):
 
     def _make_prompt(self, batch: List[Dict]) -> str:
         items = []
+
         for i, item in enumerate(batch, start=1):
-            text = (item.get("text") or item.get("source_text") or "").strip()
-            items.append({"id": i, "text": text})
+            text = self._get_segment_source_text(item)
+            items.append(
+                {
+                    "id": i,
+                    "context_before": item.get("context_before", ""),
+                    "text": text,
+                    "context_after": item.get("context_after", ""),
+                }
+            )
 
         return (
-            "Bạn là hệ thống dịch phụ đề/lồng tiếng video giáo dục sang tiếng Việt.\n"
-            "Yêu cầu:\n"
-            "- Dịch tự nhiên như lời nói, ngắn gọn để dễ lồng tiếng.\n"
+            "Bạn là hệ thống dịch phụ đề/lồng tiếng video sang tiếng Việt.\n"
+            "Nhiệm vụ:\n"
+            "- Dịch CHỈ trường `text` sang tiếng Việt.\n"
+            "- `context_before` và `context_after` chỉ dùng để hiểu ngữ cảnh, KHÔNG được dịch gộp vào kết quả.\n"
             "- Không thêm giải thích ngoài bản dịch.\n"
             "- Giữ nguyên số thứ tự id.\n"
             "- Trả về DUY NHẤT JSON array, mỗi phần tử có dạng {\"id\": 1, \"vi_text\": \"...\"}.\n"
+            "- Dịch tự nhiên như lời nói, ngắn gọn để dễ lồng tiếng.\n"
+            "- Nếu là bản tin/news, dùng giọng trang trọng, tự nhiên, không dùng 'anh/chị' trừ khi source thật sự là hội thoại trực tiếp.\n"
+            "- Không đoán mò tên riêng. Nếu không chắc tên người/công ty, hãy giữ gần nguyên dạng tiếng Anh.\n"
+            "- Tránh dịch quá dài; ưu tiên câu ngắn, dễ đọc, dễ lồng tiếng.\n"
+            "- Không để câu kết thúc bằng dấu phẩy hoặc cụm từ cụt như 'của', 'vì', 'trong', 'và'.\n"
+            "- Giữ thống nhất thuật ngữ, tên riêng, đại từ xưng hô giữa các segment.\n"
+            "- Nếu gặp đại từ như it/they/this/that/he/she, hãy dựa vào context để dịch đúng đối tượng.\n"
             f"- Phong cách: {self._domain_instruction()}\n"
             f"- Pronoun style: {self.pronoun_style}.\n\n"
-            "Dữ liệu cần dịch:\n"
-            f"{json.dumps(items, ensure_ascii=False, indent=2)}"
+            "Dữ liệu cần dịch là JSON array sau:\n"
+            f"{json.dumps(items, ensure_ascii=False, indent=2)}\n\n"
+            "Output bắt buộc:\n"
+            "[\n"
+            "  {\"id\": 1, \"vi_text\": \"Bản dịch tiếng Việt của text\"}\n"
+            "]"
         )
 
     def _call_gemini(self, prompt: str) -> str:
@@ -273,27 +386,43 @@ class GeminiTranslator(BaseTranslator):
         batches: List[List[Dict]] = []
         current: List[Dict] = []
         current_chars = 0
+
         for item in segments:
-            text = (item.get("text") or item.get("source_text") or "").strip()
-            candidate_chars = current_chars + len(text)
+            text = self._get_segment_source_text(item)
+            context_before = item.get("context_before", "")
+            context_after = item.get("context_after", "")
+
+            # Tính cả context để tránh prompt quá dài
+            item_chars = len(text) + len(context_before) + len(context_after)
+            candidate_chars = current_chars + item_chars
+
             if current and (len(current) >= self.batch_size or candidate_chars > self.max_batch_chars):
                 batches.append(current)
                 current = []
                 current_chars = 0
+
             current.append(item)
-            current_chars += len(text)
+            current_chars += item_chars
+
         if current:
             batches.append(current)
+
         return batches
 
     def translate_segments(self, segments: List[Dict]) -> List[Dict]:
-        output: List[Dict] = [dict(item) for item in segments]
+        # Level 2: gắn context trước/sau vào từng segment
+        output: List[Dict] = self._attach_context_to_segments(segments)
         to_translate: List[tuple[int, Dict]] = []
 
         for idx, item in enumerate(output):
-            source_text = (item.get("text") or item.get("source_text") or "").strip()
+            source_text = self._get_segment_source_text(item)
             item["source_text"] = source_text
-            key = self._cache_key(source_text)
+
+            context_before = item.get("context_before", "")
+            context_after = item.get("context_after", "")
+
+            key = self._cache_key(source_text, context_before, context_after)
+
             if self.cache_enabled and key in self.cache:
                 item["vi_text"] = self.cache[key]
             else:
@@ -301,8 +430,14 @@ class GeminiTranslator(BaseTranslator):
 
         batches = self._batch_segments([item for _, item in to_translate])
         cursor = 0
+
         for batch_no, batch in enumerate(batches, start=1):
-            print(f"[TRANSLATE][Gemini] batch {batch_no}/{len(batches)} | segments={len(batch)}")
+            print(
+                f"[TRANSLATE][Gemini][Context] batch {batch_no}/{len(batches)} "
+                f"| segments={len(batch)} "
+                f"| context_enabled={self.context_enabled}"
+            )
+
             prompt = self._make_prompt(batch)
             raw = self._call_gemini(prompt)
             parsed = self._extract_json_array(raw)
@@ -310,17 +445,33 @@ class GeminiTranslator(BaseTranslator):
 
             for local_id, item in enumerate(batch, start=1):
                 global_idx = to_translate[cursor][0]
+
                 source_text = item["source_text"]
+                context_before = item.get("context_before", "")
+                context_after = item.get("context_after", "")
+
                 vi_text = by_id.get(local_id) or source_text
+
                 output[global_idx]["vi_text"] = vi_text
-                self.cache[self._cache_key(source_text)] = vi_text
+
+                cache_key = self._cache_key(source_text, context_before, context_after)
+                self.cache[cache_key] = vi_text
+
                 cursor += 1
+
             self._save_cache()
+
             if self.request_sleep_seconds > 0:
                 time.sleep(self.request_sleep_seconds)
 
+        # Không cần lưu context_before/context_after ra transcript cuối nếu không muốn
+        for item in output:
+            item.pop("context_before", None)
+            item.pop("context_after", None)
+
         if self.postprocessor:
             output = self.postprocessor.postprocess_segments(output)
+
         return output
 
 
@@ -365,6 +516,13 @@ def build_translator(config: Dict) -> BaseTranslator:
             target_language=config.get("target_language", "vi"),
             content_domain=gemini_cfg.get("content_domain", "general"),
             pronoun_style=gemini_cfg.get("pronoun_style", "auto"),
+
+            # Level 2: context-aware translation
+            # Đọc được cả khi bạn để trong translation: hoặc translation.gemini:
+            context_enabled=gemini_cfg.get("context_enabled", config.get("context_enabled", True)),
+            context_window=gemini_cfg.get("context_window", config.get("context_window", 1)),
+            context_max_chars=gemini_cfg.get("context_max_chars", config.get("context_max_chars", 320)),
+
             postprocessor=postprocessor,
         )
 

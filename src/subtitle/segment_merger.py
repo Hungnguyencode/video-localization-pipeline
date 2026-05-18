@@ -163,7 +163,7 @@ def _starts_lowercase(text: str) -> bool:
 
 
 def _ends_with_terminal_punctuation(text: str) -> bool:
-    return _clean_text(text).endswith(TERMINAL_PUNCTUATION)
+    return bool(re.search(r'[.!?…]["”\')\]]?\s*$', str(text or "").strip()))
 
 
 def _starts_with_weak_word(text: str, weak_start_words: set[str]) -> bool:
@@ -206,6 +206,11 @@ def _looks_like_continuation(
 
     # Nếu khoảng cách quá xa thì không nối, tránh nối sai ý.
     if gap > max_gap_sec:
+        return False
+
+    # Nếu segment hiện tại đã kết thúc bằng dấu câu rõ ràng,
+    # không merge chỉ vì segment sau bắt đầu bằng từ yếu như "and/that/về".
+    if _ends_with_terminal_punctuation(current_text):
         return False
 
     # Case 1: segment sau bắt đầu bằng chữ thường.
@@ -252,12 +257,12 @@ def _merge_two_segments(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 def merge_segments_for_translation(
     segments: List[Dict[str, Any]],
     enabled: bool = True,
-    max_merged_duration_sec: float = 22.0,
-    max_merged_chars: int = 520,
-    continuation_max_duration_sec: float = 24.0,
-    continuation_max_chars: int = 600,
+    max_merged_duration_sec: float = 10.0,
+    max_merged_chars: int = 240,
+    continuation_max_duration_sec: float = 12.0,
+    continuation_max_chars: int = 280,
     merge_weak_boundaries: bool = True,
-    max_gap_sec: float = 1.2,
+    max_gap_sec: float = 0.8,
     weak_start_words: List[str] | None = None,
     weak_end_words: List[str] | None = None,
 ) -> List[Dict[str, Any]]:

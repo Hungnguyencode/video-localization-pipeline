@@ -92,8 +92,17 @@ class VideoLocalizationPipeline:
         segments_for_translation = merge_segments_for_translation(
             raw_segments,
             enabled=merge_cfg.get("enabled", True),
-            max_merged_duration_sec=merge_cfg.get("max_duration_sec", 16.0),
-            max_merged_chars=merge_cfg.get("max_chars", 360),
+            max_merged_duration_sec=merge_cfg.get("max_duration_sec", 10.0),
+            max_merged_chars=merge_cfg.get("max_chars", 240),
+            continuation_max_duration_sec=merge_cfg.get(
+                "continuation_max_duration_sec",
+                merge_cfg.get("max_duration_sec", 12.0),
+            ),
+            continuation_max_chars=merge_cfg.get(
+                "continuation_max_chars",
+                merge_cfg.get("max_chars", 280),
+            ),
+            max_gap_sec=merge_cfg.get("max_gap_sec", 0.8),
         )
 
         merged_source_srt_path = self._path("subtitles_dir", f"{video_stem}_source_merged.srt")

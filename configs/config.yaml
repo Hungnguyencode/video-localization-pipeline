@@ -44,11 +44,19 @@ translation:
     fallback_provider: "google_free"
     content_domain: "general"
     pronoun_style: "auto"
+    
+    # Level 2: context-aware translation
+    context_enabled: true
+    context_window: 1
+    context_max_chars: 320
 
   merge_segments:
     enabled: true
-    max_duration_sec: 16.0
-    max_chars: 360
+    max_duration_sec: 10.0
+    max_chars: 240
+    continuation_max_duration_sec: 12.0
+    continuation_max_chars: 280
+    max_gap_sec: 0.8
 
   postprocess:
     enabled: true

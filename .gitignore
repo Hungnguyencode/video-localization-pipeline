@@ -10,10 +10,11 @@
 # Bỏ qua toàn bộ file trong các thư mục data, nhưng giữ lại vỏ thư mục
 data/input/*
 data/audio/*
-data/transcripts/*
-data/subtitles/*
-data/tts_segments/*
+data/cache/*
 data/output/*
+data/subtitles/*
+data/transcripts/*
+data/tts_segments/*
 
 # (Tùy chọn) Nếu muốn Git giữ lại cấu trúc thư mục rỗng, hãy tạo 1 file .gitkeep 
 # trong mỗi thư mục trên và bỏ comment các dòng dưới đây:
@@ -23,6 +24,11 @@ data/output/*
 !data/subtitles/.gitkeep
 !data/tts_segments/.gitkeep
 !data/output/.gitkeep
+
+*.mp4
+*.wav
+*.mp3
+*.srt
 
 # =========================
 # 3. MÔI TRƯỜNG ẢO & CACHE PYTHON
