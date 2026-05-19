@@ -62,6 +62,8 @@ video-localization-pipeline/
 │   ├── audio/
 │   ├── ingest/
 │   ├── subtitle/
+│   ├── translation/
+│   ├── video_render/
 │   └── utils/
 ├── data/
 │   ├── input/

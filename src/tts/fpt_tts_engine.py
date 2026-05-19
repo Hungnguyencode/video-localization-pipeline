@@ -10,6 +10,8 @@ from typing import List
 
 import requests
 from dotenv import load_dotenv
+from src.tts.fpt_tts_profile import clean_text_for_fpt_tts, fpt_speed_from_rate
+from src.tts.audio_timing import stretch_audio_if_too_short
 
 FPT_TTS_URL = "https://api.fpt.ai/hmi/tts/v5"
 
@@ -63,16 +65,33 @@ class FPTTTSEngine:
         speed: str = "0",
         audio_format: str = "mp3",
         use_cache: bool = True,
+        target_ms: int | None = None,
+        target_sec: float | None = None,
+        target_duration_ms: int | None = None,
+        target_duration_sec: float | None = None,
+        **kwargs,
     ) -> str:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        text = self._clean_text(text)
+        # Chấp nhận nhiều tên target duration khác nhau để dễ tương thích với wrapper/pipeline.
+        if target_ms is None:
+            target_ms = target_duration_ms or kwargs.get("duration_ms") or kwargs.get("target_audio_ms")
+        if target_sec is None:
+            target_sec = target_duration_sec or kwargs.get("duration_sec") or kwargs.get("target_audio_sec")
+
+        # FPT.AI đọc nhanh hơn Edge, nên không cho nó ăn theo rate kiểu "+15%".
+        # Ví dụ Edge rate "+15%" sẽ được map về FPT speed "0".
+        safe_speed = fpt_speed_from_rate(speed)
+
+        # Dọn text riêng cho FPT để giảm ngắt gắt ở câu cụt / dấu câu xấu.
+        text = clean_text_for_fpt_tts(self._clean_text(text))
         if len(text) < 2:
             raise ValueError("FPT TTS text is empty or too short.")
 
         if use_cache and output_path.exists() and output_path.stat().st_size > 0:
             print(f"[FPT TTS] Cache hit: {output_path.name}")
+            self._stretch_output_if_needed(output_path, target_ms=target_ms, target_sec=target_sec)
             return str(output_path)
 
         chunks = self._split_text(text, self.chunk_chars)
@@ -80,13 +99,15 @@ class FPTTTSEngine:
             raise ValueError("FPT TTS text has no valid chunks.")
 
         if len(chunks) == 1:
-            return self._synthesize_chunk_or_split(
+            result = self._synthesize_chunk_or_split(
                 text=chunks[0],
                 output_path=output_path,
                 voice=voice,
-                speed=speed,
+                speed=safe_speed,
                 audio_format=audio_format,
             )
+            self._stretch_output_if_needed(output_path, target_ms=target_ms, target_sec=target_sec)
+            return result
 
         tmp_dir = output_path.parent / f".tmp_{output_path.stem}"
         if tmp_dir.exists():
@@ -97,7 +118,7 @@ class FPTTTSEngine:
         try:
             print(
                 f"[FPT TTS] Long segment -> {len(chunks)} chunks | "
-                f"chars={len(text)} | voice={voice} | speed={speed}"
+                f"chars={len(text)} | voice={voice} | speed={safe_speed}"
             )
             for i, chunk in enumerate(chunks, start=1):
                 chunk_path = tmp_dir / f"chunk_{i:03d}.{audio_format}"
@@ -106,7 +127,7 @@ class FPTTTSEngine:
                     text=chunk,
                     output_path=chunk_path,
                     voice=voice,
-                    speed=speed,
+                    speed=safe_speed,
                     audio_format=audio_format,
                 )
                 chunk_paths.append(chunk_path)
@@ -114,6 +135,7 @@ class FPTTTSEngine:
             self._concat_audio_files(chunk_paths, output_path)
             if not output_path.exists() or output_path.stat().st_size <= 0:
                 raise RuntimeError(f"FPT concat output is empty: {output_path}")
+            self._stretch_output_if_needed(output_path, target_ms=target_ms, target_sec=target_sec)
             return str(output_path)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -185,18 +207,20 @@ class FPTTTSEngine:
         ) from last_error
 
     def _request_async_url(self, text: str, voice: str, speed: str, audio_format: str) -> str:
+        safe_text = clean_text_for_fpt_tts(self._clean_text(text))
+        safe_speed = fpt_speed_from_rate(speed)
         headers = {
             "api-key": self.api_key,
             "api_key": self.api_key,
             "voice": str(voice or "banmai").replace("fpt:", ""),
-            "speed": str(speed or "0"),
+            "speed": safe_speed,
             "format": str(audio_format or "mp3"),
             "Cache-Control": "no-cache",
         }
         response = self.session.post(
             FPT_TTS_URL,
             headers=headers,
-            data=text.encode("utf-8"),
+            data=safe_text.encode("utf-8"),
             timeout=self.timeout_sec,
         )
 
@@ -286,7 +310,7 @@ class FPTTTSEngine:
         return text
 
     def _split_text(self, text: str, max_chars: int) -> List[str]:
-        text = self._clean_text(text)
+        text = clean_text_for_fpt_tts(self._clean_text(text))
         if not text:
             return []
         max_chars = max(int(max_chars), self.min_chunk_chars)
@@ -309,7 +333,7 @@ class FPTTTSEngine:
                 else:
                     final_chunks.extend(self._hard_split_by_space(comma_chunk, max_chars))
 
-        return [self._clean_text(c) for c in final_chunks if c and c.strip()]
+        return [clean_text_for_fpt_tts(self._clean_text(c)) for c in final_chunks if c and c.strip()]
 
     @staticmethod
     def _split_by_regex(text: str, pattern: str) -> List[str]:
@@ -355,51 +379,126 @@ class FPTTTSEngine:
             chunks.append(current)
         return chunks
 
+    @staticmethod
+    def _resolve_target_ms(target_ms: int | None = None, target_sec: float | None = None) -> int | None:
+        if target_ms is not None:
+            try:
+                value = int(target_ms)
+                return value if value > 0 else None
+            except Exception:
+                return None
+        if target_sec is not None:
+            try:
+                value = int(float(target_sec) * 1000)
+                return value if value > 0 else None
+            except Exception:
+                return None
+        return None
+
+    def _stretch_output_if_needed(
+        self,
+        output_path: Path,
+        *,
+        target_ms: int | None = None,
+        target_sec: float | None = None,
+    ) -> None:
+        """
+        Kéo chậm nhẹ FPT audio nếu caller truyền target duration.
+        Không tự kéo khi không có target để tránh làm méo audio ngoài ý muốn.
+        """
+        resolved_target_ms = self._resolve_target_ms(target_ms=target_ms, target_sec=target_sec)
+        if not resolved_target_ms:
+            return
+        stretch_info = stretch_audio_if_too_short(
+            output_path,
+            resolved_target_ms,
+            min_ratio=0.82,
+            min_tempo=0.86,
+            max_tempo=0.98,
+        )
+        if stretch_info.get("changed"):
+            print(
+                "[TTS][FPT][Stretch] "
+                f"{output_path.name} | "
+                f"before={stretch_info.get('before_ms')}ms | "
+                f"after={stretch_info.get('after_ms')}ms | "
+                f"target={stretch_info.get('target_ms')}ms | "
+                f"tempo={stretch_info.get('tempo')}"
+            )
+
     def _concat_audio_files(self, input_paths: List[Path], output_path: Path) -> None:
+        """
+        Ghép các chunk FPT thành 1 file MP3 sạch.
+
+        Quan trọng: KHÔNG dùng `-c copy` và KHÔNG byte-concat MP3.
+        Với FPT, mỗi chunk có header/timestamp riêng. Nếu nối copy thẳng,
+        đoạn sau có thể bị vỡ, bị bỏ qua hoặc mất vế cuối khi ffmpeg mux vào video.
+        """
         input_paths = [Path(p) for p in input_paths if Path(p).exists() and Path(p).stat().st_size > 0]
         if not input_paths:
             raise RuntimeError("No FPT audio chunks to concat.")
+
         if len(input_paths) == 1:
             shutil.copyfile(input_paths[0], output_path)
             return
 
-        if shutil.which("ffmpeg"):
-            list_file = output_path.parent / f"{output_path.stem}_concat.txt"
-            try:
-                lines = []
-                for path in input_paths:
-                    safe_path = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
-                    lines.append(f"file '{safe_path}'")
-                list_file.write_text("\n".join(lines), encoding="utf-8")
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-f",
-                        "concat",
-                        "-safe",
-                        "0",
-                        "-i",
-                        str(list_file),
-                        "-c",
-                        "copy",
-                        str(output_path),
-                    ],
-                    check=True,
-                )
-                if output_path.exists() and output_path.stat().st_size > 0:
-                    return
-            except Exception as exc:  # noqa: BLE001
-                print(f"[FPT TTS] ffmpeg concat failed, fallback byte concat: {exc}")
-            finally:
-                try:
-                    list_file.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError(
+                "Cần ffmpeg để nối nhiều chunk FPT an toàn. "
+                "Không được byte-concat MP3 vì dễ vỡ/mất câu cuối."
+            )
 
-        with output_path.open("wb") as out:
+        list_file = output_path.parent / f"{output_path.stem}_concat.txt"
+        tmp_output = output_path.with_name(f"{output_path.stem}.concat_tmp.mp3")
+
+        try:
+            lines = []
             for path in input_paths:
-                out.write(path.read_bytes())
+                safe_path = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
+                lines.append(f"file '{safe_path}'")
+            list_file.write_text("\n".join(lines), encoding="utf-8")
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-fflags",
+                    "+genpts",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_file),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "64k",
+                    str(tmp_output),
+                ],
+                check=True,
+            )
+
+            if not tmp_output.exists() or tmp_output.stat().st_size <= 1024:
+                raise RuntimeError(f"FPT concat output is empty/broken: {tmp_output}")
+
+            tmp_output.replace(output_path)
+
+        finally:
+            try:
+                list_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                tmp_output.unlink(missing_ok=True)
+            except Exception:
+                pass
+

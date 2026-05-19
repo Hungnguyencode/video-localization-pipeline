@@ -457,7 +457,7 @@ class EdgeTTSEngine:
                     f"Voice={voice}"
                 )
                 self._delete_bad_audio(output_path, "NoAudioReceived")
-                time.sleep(1.2)
+                time.sleep(min(2.0 * attempt, 10.0))
 
             except Exception as exc:
                 last_error = exc
@@ -466,7 +466,7 @@ class EdgeTTSEngine:
                     f"Voice={voice}, Reason={exc}"
                 )
                 self._delete_bad_audio(output_path, str(exc))
-                time.sleep(1.2)
+                time.sleep(min(2.0 * attempt, 10.0))
 
         raise RuntimeError(
             f"Edge TTS failed after {self.max_retries} retries: {last_error}"

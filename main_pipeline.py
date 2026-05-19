@@ -9,14 +9,15 @@ from src.asr.whisper_asr import FasterWhisperASR
 from src.audio.extractor import AudioExtractor
 from src.ingest.local_video import LocalVideoIngestor
 from src.subtitle.segment_merger import merge_segments_for_translation
+from src.subtitle.segment_text_guard import repair_tiny_tts_segments
 from src.subtitle.srt_writer import SubtitleWriter
 from src.translation.translator import build_translator
+from src.translation.vi_postprocess import postprocess_vi_segments
 from src.tts.edge_tts_engine import EdgeTTSEngine
 from src.utils.config import ensure_dir, load_config, resolve_path
 from src.utils.io import load_json, save_json
 from src.utils.media import get_video_duration_seconds
 from src.video_render.renderer import VideoRenderer
-
 
 class VideoLocalizationPipeline:
     def __init__(self, config_path: str = "configs/config.yaml"):
@@ -121,6 +122,18 @@ class VideoLocalizationPipeline:
         )
 
         translated_segments = self.translator.translate_segments(segments_for_translation)
+
+        # Hậu xử lý chất lượng câu tiếng Việt trước khi lưu bilingual/subtitle.
+        # Sửa lỗi thuật ngữ/tên riêng thường gặp rồi mới vá segment quá ngắn/câu cụt.
+        translated_segments = postprocess_vi_segments(translated_segments)
+        translated_segments = repair_tiny_tts_segments(
+            translated_segments,
+            min_duration_sec=0.65,
+            min_chars=5,
+            max_gap_sec=1.20,
+            protect_voice_boundary=True,
+        )
+
         bilingual_data = {
             "video_name": video_name,
             "video_stem": video_stem,
@@ -174,6 +187,21 @@ class VideoLocalizationPipeline:
         video_duration = float(bilingual_data["video_duration_sec"])
         input_video_path = bilingual_data["input_video_path"]
         translated_segments = bilingual_data["segments"]
+
+        # Dọn lại một lần nữa khi render để xử lý cả file bilingual cũ hoặc bản đã chỉnh thủ công.
+        # Phải đặt trước write_vietnamese_srt() và trước synthesize_segments() để subtitle và audio khớp nhau.
+        translated_segments = postprocess_vi_segments(translated_segments)
+        translated_segments = repair_tiny_tts_segments(
+            translated_segments,
+            min_duration_sec=0.65,
+            min_chars=5,
+            max_gap_sec=1.20,
+            protect_voice_boundary=True,
+        )
+
+        # Cập nhật ngược lại vào bilingual_data để các bước sau/UI/report dùng cùng bản đã sửa.
+        bilingual_data["segments"] = translated_segments
+        save_json(bilingual_data, bilingual_path)
 
         render_cfg = self.config.get("render", {})
         audio_mode = audio_mode or render_cfg.get("audio_mode", "replace")
@@ -233,7 +261,7 @@ class VideoLocalizationPipeline:
             tts_dir = self._path("tts_segments_dir", video_stem)
             if tts_dir.exists():
                 shutil.rmtree(tts_dir)
-
+        
         tts_segments = self.tts_engine.synthesize_segments(
             translated_segments,
             video_stem=video_stem,
@@ -284,7 +312,6 @@ class VideoLocalizationPipeline:
         rendered = self.render_from_bilingual(prepared["bilingual_transcript_path"], clear_tts_cache=True)
         return {**prepared, **rendered}
 
-
 if __name__ == "__main__":
     import argparse
 
@@ -298,3 +325,4 @@ if __name__ == "__main__":
     print("=== Pipeline finished ===")
     for key, value in result.items():
         print(f"{key}: {value}")
+

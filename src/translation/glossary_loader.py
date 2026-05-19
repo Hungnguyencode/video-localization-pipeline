@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List
 
 import yaml
+import re
 
 
 Replacement = List[str]
@@ -107,3 +108,68 @@ def parse_quick_replacements(text: str) -> List[Replacement]:
             replacements.append(normalized)
 
     return deduplicate_replacements(replacements)
+
+
+def apply_replacements(text: str, replacements=None) -> str:
+    """
+    Áp dụng danh sách thay thế từ glossary/replacements lên text tiếng Việt.
+    Hàm này được vi_postprocess.py gọi để sửa các lỗi tên riêng/cụm từ.
+    Nếu không có replacements thì trả nguyên text, không làm hỏng pipeline.
+    """
+    if text is None:
+        return ""
+
+    result = str(text)
+
+    if not replacements:
+        return result
+
+    for item in replacements:
+        if not item:
+            continue
+
+        src = None
+        dst = ""
+
+        regex = False
+        ignore_case = False
+
+        if isinstance(item, dict):
+            src = (
+                item.get("from")
+                or item.get("source")
+                or item.get("old")
+                or item.get("pattern")
+            )
+            dst = (
+                item.get("to")
+                or item.get("target")
+                or item.get("new")
+                or item.get("replacement")
+                or ""
+            )
+            regex = bool(item.get("regex", False))
+            ignore_case = bool(item.get("ignore_case", False))
+
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            src = item[0]
+            dst = item[1]
+
+        if not src:
+            continue
+
+        flags = re.IGNORECASE if ignore_case else 0
+
+        try:
+            if regex:
+                result = re.sub(str(src), str(dst), result, flags=flags)
+            else:
+                if ignore_case:
+                    result = re.sub(re.escape(str(src)), str(dst), result, flags=flags)
+                else:
+                    result = result.replace(str(src), str(dst))
+        except Exception:
+            # Không để glossary làm hỏng toàn pipeline
+            continue
+
+    return result

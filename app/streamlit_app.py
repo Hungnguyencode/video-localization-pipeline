@@ -61,6 +61,7 @@ def cache_step(file_path, data=None):
             json.dump(data, f, ensure_ascii=False, indent=2)
 
 from src.translation.translator import PROMPT_VERSION
+from src.subtitle.segment_text_guard import repair_tiny_tts_segments, clean_vi_text_for_output as guard_clean_vi_text_for_output
 
 # =========================
 # Options
@@ -161,6 +162,34 @@ def rate_rank(rate_value: str) -> int:
 
 def max_rate(a: str, b: str) -> str:
     return a if rate_rank(a) >= rate_rank(b) else b
+
+
+def is_fpt_voice_value(voice_value: str | None) -> bool:
+    """Nhận diện voice FPT.AI từ cả value lẫn label hiển thị."""
+    value = str(voice_value or "").strip().lower()
+    return value.startswith("fpt:") or "fpt.ai" in value or "fpt" in value
+
+
+def normalize_default_rate_for_provider(rate_label: str | None, voice_value: str | None) -> str:
+    """
+    Edge có thể dùng +10/+15/+20.
+    FPT.AI vốn đọc nhanh hơn, nên default luôn về Mặc định.
+    """
+    label = canonical_rate_label(rate_label)
+    if is_fpt_voice_value(voice_value):
+        return DEFAULT_RATE_LABEL
+    return label
+
+
+def normalize_rate_for_voice(rate_label: str | None, voice_value: str | None) -> str:
+    """
+    Chỉ can thiệp rate tự động/default của FPT.AI.
+    Rate âm như Chậm hơn (-10%) vẫn được giữ nếu user cố tình chọn.
+    """
+    label = canonical_rate_label(rate_label)
+    if is_fpt_voice_value(voice_value) and rate_rank(get_rate_value(label)) > 0:
+        return DEFAULT_RATE_LABEL
+    return label
 
 
 # =========================
@@ -369,21 +398,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 def clean_vi_text_for_output(text: str) -> str:
-    text = str(text or "").strip()
-    text = re.sub(r"\s+", " ", text)
-
-    # Dọn lỗi kiểu ",.", ",!", dấu câu sát chữ...
-    text = re.sub(r"\s*([,;:])\s*([.!?])", r"\2", text)
-    text = re.sub(r"([.!?])\s*([.!?])+", r"\1", text)
-    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
-    text = re.sub(r"([,.!?;:])(?!\d)([^\s])", r"\1 \2", text)
-
-    text = text.strip()
-
-    if text and text[-1] not in ".!?…":
-        text += "."
-
-    return text
+    """Dọn câu tiếng Việt nhưng không tự bịa dấu chấm cho câu nối giữa segment."""
+    return guard_clean_vi_text_for_output(text, force_terminal=False)
 
 def build_editor_dataframe(bilingual_data: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -411,6 +427,9 @@ def build_editor_dataframe(bilingual_data: Dict[str, Any]) -> pd.DataFrame:
         voice_value = item.get("voice") or item.get("tts_voice") or DEFAULT_VOICE_VALUE
         voice_label = item.get("voice_label") or get_voice_label(voice_value)
         voice_label = canonical_voice_label(voice_label)
+        voice_value = get_voice_value(voice_label)
+        if not rate_manual:
+            rate_label = normalize_rate_for_voice(rate_label, voice_value)
 
         speaker_role = str(item.get("speaker_role") or "Mặc định")
         if speaker_role not in SPEAKER_ROLE_OPTIONS:
@@ -480,6 +499,11 @@ def normalize_editor_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     output["voice_label"] = output["voice_label"].apply(canonical_voice_label)
     output["voice"] = output["voice_label"].apply(get_voice_value)
     output["rate_label"] = output.apply(lambda r: canonical_rate_label(r.get("rate_label"), r.get("rate")), axis=1)
+    output["rate_label"] = output.apply(
+        lambda r: normalize_rate_for_voice(r.get("rate_label"), r.get("voice"))
+        if not bool(r.get("rate_manual", False)) else canonical_rate_label(r.get("rate_label"), r.get("rate")),
+        axis=1,
+    )
     output["rate"] = output["rate_label"].apply(get_rate_value)
     output["voice_manual"] = output["voice_manual"].astype(bool)
     output["rate_manual"] = output["rate_manual"].astype(bool)
@@ -612,7 +636,16 @@ def auto_split_long_segments_df(
             output_rows.append(new_row.to_dict())
             cursor = part_end
 
-    return normalize_editor_dataframe(pd.DataFrame(output_rows))
+    # Sau khi tách dài, vá lại các mảnh quá ngắn/câu cụt kiểu "sân bay."
+    # Đây là phần giúp tránh lỗi 41 segment trên UI nhưng khi render còn 37 segment.
+    repaired_rows = repair_tiny_tts_segments(
+        output_rows,
+        min_duration_sec=0.65,
+        min_chars=5,
+        max_gap_sec=1.20,
+        protect_voice_boundary=True,
+    )
+    return normalize_editor_dataframe(pd.DataFrame(repaired_rows))
 
 def apply_voice_to_segment_ranges(range_text: str, voice_label: str, speaker_role: str = "Tùy chỉnh") -> int:
     df = st.session_state.get("editor_df")
@@ -819,23 +852,31 @@ def split_segment(
 
 def apply_auto_rate(df: pd.DataFrame, default_rate_label: str) -> pd.DataFrame:
     output = normalize_editor_dataframe(df)
-    default_rate = get_rate_value(default_rate_label)
     for idx, row in output.iterrows():
         if bool(row.get("rate_manual", False)):
             continue
-        cps = _safe_float(row.get("chars_per_sec"), 0.0)
-        if cps <= 14:
-            target = default_rate
-        elif cps <= 19:
-            target = max_rate(default_rate, "+10%")
-        elif cps <= 23:
-            target = max_rate(default_rate, "+15%")
+
+        voice_value = row.get("voice") or get_voice_value(row.get("voice_label"))
+        effective_default_label = normalize_default_rate_for_provider(default_rate_label, voice_value)
+        effective_default_rate = get_rate_value(effective_default_label)
+
+        # FPT.AI đọc nhanh/ngắt nhiều hơn Edge, nên auto-rate không được đẩy lên +10/+15/+20.
+        if is_fpt_voice_value(voice_value):
+            target = effective_default_rate
         else:
-            target = max_rate(default_rate, "+20%")
+            cps = _safe_float(row.get("chars_per_sec"), 0.0)
+            if cps <= 14:
+                target = effective_default_rate
+            elif cps <= 19:
+                target = max_rate(effective_default_rate, "+10%")
+            elif cps <= 23:
+                target = max_rate(effective_default_rate, "+15%")
+            else:
+                target = max_rate(effective_default_rate, "+20%")
+
         output.at[idx, "rate"] = target
         output.at[idx, "rate_label"] = RATE_REVERSE_OPTIONS.get(target, DEFAULT_RATE_LABEL)
     return output
-
 
 def build_role_voice_map(role_a_voice: str, role_b_voice: str, role_c_voice: str) -> dict[str, str]:
     return {
@@ -877,11 +918,13 @@ def build_render_dataframe(
     if auto_rate_enabled:
         render_df = apply_auto_rate(render_df, default_rate_label)
     else:
-        default_rate = get_rate_value(default_rate_label)
         for idx, row in render_df.iterrows():
             if not bool(row.get("rate_manual", False)):
-                render_df.at[idx, "rate"] = default_rate
-                render_df.at[idx, "rate_label"] = RATE_REVERSE_OPTIONS.get(default_rate, DEFAULT_RATE_LABEL)
+                voice_value = row.get("voice") or get_voice_value(row.get("voice_label"))
+                safe_rate_label = normalize_default_rate_for_provider(default_rate_label, voice_value)
+                safe_rate = get_rate_value(safe_rate_label)
+                render_df.at[idx, "rate"] = safe_rate
+                render_df.at[idx, "rate_label"] = safe_rate_label
     return normalize_editor_dataframe(render_df)
 
 
@@ -895,7 +938,10 @@ def save_edited_bilingual(bilingual_path: str | Path, edited_df: pd.DataFrame) -
         vi_text = clean_vi_text_for_output(row.get("vi_text", ""))
         raw_vi_text = clean_vi_text_for_output(row.get("raw_vi_text", vi_text))
         voice_label = canonical_voice_label(row.get("voice_label"))
+        voice_value = get_voice_value(voice_label)
         rate_label = canonical_rate_label(row.get("rate_label"), row.get("rate"))
+        if not bool(row.get("rate_manual", False)):
+            rate_label = normalize_rate_for_voice(rate_label, voice_value)
         start = _safe_float(row.get("start"), 0.0)
         end = _safe_float(row.get("end"), start + 0.1)
         edited_segments.append(
@@ -1069,16 +1115,18 @@ def reset_working_state() -> None:
 
 def make_preview_audio(segment_id: int, text: str, voice: str, rate: str) -> str:
     pipeline = get_pipeline()
+    safe_rate_label = normalize_rate_for_voice(canonical_rate_label(None, rate), voice)
+    safe_rate_value = get_rate_value(safe_rate_label)
     pipeline.tts_engine.voice = voice
-    pipeline.tts_engine.rate = rate
+    pipeline.tts_engine.rate = safe_rate_value
     preview_dir = PROJECT_ROOT / "data" / "tts_segments" / "_preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
     safe_voice = re.sub(r"[^a-zA-Z0-9_]+", "_", voice)
-    safe_rate = re.sub(r"[^a-zA-Z0-9_+\-]+", "_", rate)
+    safe_rate = re.sub(r"[^a-zA-Z0-9_+\-]+", "_", safe_rate_value)
     output_path = preview_dir / f"segment_{segment_id:04d}_{safe_voice}_{safe_rate}.mp3"
     if output_path.exists():
         output_path.unlink()
-    pipeline.tts_engine.synthesize_one(text=text, output_path=output_path, voice=voice, rate=rate, use_cache=False)
+    pipeline.tts_engine.synthesize_one(text=text, output_path=output_path, voice=voice, rate=safe_rate_value, use_cache=False)
     return str(output_path)
 
 
@@ -1505,8 +1553,18 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
             default_voice_label = st.selectbox("Giọng mặc định", options=list(VOICE_OPTIONS.keys()), index=0)
             voice_render_mode_label = st.selectbox("Cách dùng giọng khi render", options=list(VOICE_RENDER_MODE_OPTIONS.keys()), index=0)
         with col_rate:
-            default_rate_label = st.selectbox("Tốc độ mặc định", options=list(RATE_OPTIONS.keys()), index=3, help="Video news thường nói nhanh, nên thử +15% hoặc +20%.")
-            auto_rate_enabled = st.checkbox("Tự động chỉnh tốc độ theo từng segment", value=True, help="Segment dài sẽ tự dùng +10%, +15% hoặc +20% nếu chưa chỉnh rate thủ công.")
+            default_voice_value_for_rate = get_voice_value(default_voice_label)
+            default_rate_index = 1 if is_fpt_voice_value(default_voice_value_for_rate) else 3
+            raw_default_rate_label = st.selectbox(
+                "Tốc độ mặc định",
+                options=list(RATE_OPTIONS.keys()),
+                index=default_rate_index,
+                help="Edge có thể thử +15%; FPT.AI sẽ tự đưa về Mặc định để tránh đọc nhanh/ngắt nhiều.",
+            )
+            default_rate_label = normalize_default_rate_for_provider(raw_default_rate_label, default_voice_value_for_rate)
+            if default_rate_label != raw_default_rate_label:
+                st.info("Đang chọn FPT.AI nên app tự dùng tốc độ Mặc định, không dùng +10/+15/+20 như Edge.")
+            auto_rate_enabled = st.checkbox("Tự động chỉnh tốc độ theo từng segment", value=True, help="Segment dài sẽ tự dùng +10%, +15% hoặc +20% với Edge. Với FPT.AI, hệ thống giữ tốc độ Mặc định để tránh đọc nhanh/ngắt nhiều.")
             auto_fix_alignment_enabled = st.checkbox(
                 "Tự động auto-fix TTS dài trước khi xuất video",
                 value=True,
@@ -1611,7 +1669,9 @@ if "prepare_result" in st.session_state and "editor_df" in st.session_state:
                 with st.spinner("Đang tạo video đầu ra..."):
                     pipeline = get_pipeline()
                     pipeline.tts_engine.voice = get_voice_value(default_voice_label)
-                    pipeline.tts_engine.rate = get_rate_value(default_rate_label)
+                    pipeline.tts_engine.rate = get_rate_value(
+                        normalize_default_rate_for_provider(default_rate_label, get_voice_value(default_voice_label))
+                    )
                     # =====================================================
                     # Level 3B auto-fix trong 1 lần bấm render
                     # Pass 1: render/TTS để đo duration audio

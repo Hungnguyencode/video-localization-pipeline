@@ -1,222 +1,214 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Iterable, List, Sequence
 
-from src.translation.glossary_loader import (
-    deduplicate_replacements,
-    load_replacements_from_files,
+from src.translation.glossary_loader import apply_replacements
+
+_DANGLING_END_RE = re.compile(
+    r"(?:\b(?:và|hoặc|nhưng|rằng|là|của|cho|với|từ|để|trong|vào|ở|một|có thể là|bao gồm cả)\b)\s*[.!?…]*$",
+    re.IGNORECASE,
 )
+_CONTINUATION_START_RE = re.compile(
+    r"^\s*[\"'“”‘’()\[\]]*(?:[a-zà-ỹ]|(?:trong|đến|từ|các|những|một|về|với|cho|của|ở|vào|tuần|tháng|sân bay|thời gian|tác động|hoạt động|hy vọng|lo ngại)\b)",
+    re.IGNORECASE,
+)
+_TERMINAL_RE = re.compile(r"[.!?…]+$")
 
+
+def _basic_cleanup(text: str) -> str:
+    text = (text or "").strip()
+    text = text.replace("\u200b", " ").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?…])", r"\1", text)
+    text = re.sub(r"([,;:])(?=\S)", r"\1 ", text)
+    text = re.sub(r"\.\s*\.\s*\.\s*", "… ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _should_force_final_punctuation(text: str, source_text: str | None = None) -> bool:
+    if not text or re.search(r"[.!?…]$", text):
+        return False
+    if _CONTINUATION_START_RE.search(text) or _DANGLING_END_RE.search(text):
+        return False
+    if source_text:
+        src = source_text.strip()
+        # If the source segment itself has no sentence-ending punctuation, do not
+        # invent a hard stop in Vietnamese. The segment merger will repair it later.
+        if src and not re.search(r"[.!?…]$", src):
+            return False
+    return True
+
+
+def postprocess_vi_text(
+    text: str,
+    *,
+    glossary_replacements: Sequence[dict] | None = None,
+    source_text: str | None = None,
+    force_terminal: bool = False,
+) -> str:
+    text = _basic_cleanup(text)
+    if glossary_replacements:
+        text = apply_replacements(text, glossary_replacements)
+        text = _basic_cleanup(text)
+
+    # Remove fake terminal punctuation from dangling fragments.
+    if _DANGLING_END_RE.search(text):
+        text = _TERMINAL_RE.sub("", text).strip()
+
+    if force_terminal and _should_force_final_punctuation(text, source_text):
+        text += "."
+    return text
+
+
+def postprocess_vi_segments(
+    segments: Iterable[dict],
+    *,
+    glossary_replacements: Sequence[dict] | None = None,
+    force_terminal: bool = False,
+) -> List[dict]:
+    out: List[dict] = []
+    for seg in segments:
+        item = dict(seg)
+        vi = item.get("vi_text") or item.get("target_text") or item.get("text") or ""
+        src = item.get("source_text") or item.get("en_text") or item.get("original_text") or ""
+        cleaned = postprocess_vi_text(
+            vi,
+            glossary_replacements=glossary_replacements,
+            source_text=src,
+            force_terminal=force_terminal,
+        )
+        if "vi_text" in item:
+            item["vi_text"] = cleaned
+        elif "target_text" in item:
+            item["target_text"] = cleaned
+        else:
+            item["text"] = cleaned
+        out.append(item)
+    return out
+
+# ============================================================
+# Backward compatibility for src/translation/translator.py
+# translator.py cũ đang import VietnamesePostProcessor và build_vi_postprocessor
+# nên cần giữ lại 2 API này để app không crash.
+# ============================================================
 
 class VietnamesePostProcessor:
     """
-    Hậu xử lý tiếng Việt theo hướng generic.
-
-    Nguyên tắc:
-    - Không hard-code theo một video cụ thể.
-    - Thuật ngữ/idiom theo lĩnh vực đưa vào glossary YAML.
-    - File Python chỉ giữ logic xử lý chung.
+    Wrapper tương thích với translator.py cũ.
+    Dùng các hàm postprocess hiện có trong file này để làm sạch tiếng Việt.
     """
 
-    def __init__(
-        self,
-        enabled: bool = True,
-        style: str = "natural_spoken",
-        shorten_for_tts: bool = False,
-        max_chars_per_second: float = 17.0,
-        replacements: List[List[str]] | None = None,
-        glossary_files: List[str] | None = None,
-    ):
-        self.enabled = bool(enabled)
-        self.style = style
-        self.shorten_for_tts = bool(shorten_for_tts)
-        self.max_chars_per_second = float(max_chars_per_second)
+    def __init__(self, replacements=None, enabled: bool = True, **kwargs):
+        self.replacements = replacements or []
+        self.enabled = enabled
 
-        glossary_replacements = load_replacements_from_files(glossary_files or [])
-        config_replacements = replacements or []
+    def process(self, text: str) -> str:
+        if not self.enabled:
+            return text or ""
 
-        self.replacements = deduplicate_replacements(
-            glossary_replacements + config_replacements
-        )
+        value = str(text or "")
 
-    def _fix_number_separators(self, text: str) -> str:
-        """
-        Sửa lỗi số bị tách khoảng trắng:
-        13. 000 -> 13.000
-        850. 000 -> 850.000
-        13 , 000 -> 13,000
-        """
+        # Áp glossary/replacements nếu có
+        try:
+            value = apply_replacements(value, self.replacements)
+        except Exception:
+            pass
 
-        text = str(text or "")
+        # Nếu file đang có hàm postprocess_vi_text thì dùng
+        fn = globals().get("postprocess_vi_text")
+        if callable(fn):
+            try:
+                return fn(value)
+            except TypeError:
+                try:
+                    return fn(value, replacements=self.replacements)
+                except Exception:
+                    return value
+            except Exception:
+                return value
 
-        for _ in range(3):
-            text = re.sub(
-                r"(?<=\d)\s*([,.])\s*(?=\d{3}(\D|$))",
-                r"\1",
-                text,
-            )
+        # Fallback dọn nhẹ nếu không có postprocess_vi_text
+        import re
+        value = re.sub(r"\s+", " ", value).strip()
+        value = re.sub(r"\s+([,.;:!?…])", r"\1", value)
+        value = re.sub(r"([,.;:!?…])([^\s\d])", r"\1 \2", value)
+        value = re.sub(r"(\d+)\s*\.\s*(\d{3})(?!\d)", r"\1.\2", value)
+        value = re.sub(r"(\d+)\s*,\s*(\d+)", r"\1,\2", value)
+        return value
 
-        return text
+    def postprocess(self, text: str) -> str:
+        return self.process(text)
 
-    def normalize_text(self, text: str) -> str:
-        text = (text or "").strip()
+    def __call__(self, text: str) -> str:
+        return self.process(text)
 
-        if not text:
-            return ""
+    def process_segment(self, segment: dict) -> dict:
+        if not isinstance(segment, dict):
+            return segment
 
-        text = self._fix_number_separators(text)
-        text = re.sub(r"\s+", " ", text)
+        item = dict(segment)
 
-        # Dọn lỗi dấu câu thừa: ",.", ",!", ";."...
-        text = re.sub(r"\s*([,;:])\s*([.!?])", r"\2", text)
-
-        # Dọn lặp dấu kết câu: "..", "!!", ".!"
-        text = re.sub(r"([.!?])\s*([.!?])+", r"\1", text)
-
-        # Xóa khoảng trắng trước dấu câu.
-        text = re.sub(r"(?<!\d)\s+([,.!?;:])", r"\1", text)
-
-        # Thêm khoảng trắng sau dấu câu, nhưng không phá số 13.000.
-        text = re.sub(r"([,.!?;:])(?!\d)([^\s])", r"\1 \2", text)
-
-        text = self._fix_number_separators(text)
-        text = re.sub(r"\s+", " ", text)
-
-        return text.strip()
-
-    def apply_replacements(self, text: str) -> str:
-        sorted_rules = sorted(
-            self.replacements,
-            key=lambda pair: len(str(pair[0])),
-            reverse=True,
-        )
-
-        for src, dst in sorted_rules:
-            src = str(src).strip()
-            dst = str(dst).strip()
-
-            if not src:
-                continue
-
-            text = text.replace(src, dst)
-
-        return text
-
-    def soften_spoken_style(self, text: str) -> str:
-        if self.style != "natural_spoken":
-            return text
-
-        general_rules = [
-            ("Chỉ cần đảm bảo rằng", "Chỉ cần nhớ rằng"),
-            ("Trên thực tế,", "Thật ra,"),
-            ("Thành thật mà nói,", "Thật ra,"),
-            ("Từ kinh nghiệm của tôi,", "Theo kinh nghiệm của mình,"),
-            ("Tôi khuyên bạn nên", "Bạn nên"),
-            ("Tôi sử dụng", "Mình dùng"),
-            ("Tôi đã từng", "Mình từng"),
-            ("Tôi hơi", "Mình hơi"),
-            ("video của tôi", "video của mình"),
-            ("cho tôi biết", "cho mình biết"),
-            ("Cảm ơn đã xem", "Cảm ơn mọi người đã xem"),
-        ]
-
-        for src, dst in general_rules:
-            text = text.replace(src, dst)
-
-        return text
-
-    def shorten_text_for_tts(self, text: str, duration_sec: float | None) -> str:
-        if not self.shorten_for_tts or duration_sec is None or duration_sec <= 0:
-            return text
-
-        max_chars = int(duration_sec * self.max_chars_per_second)
-
-        if len(text) <= max_chars:
-            return text
-
-        generic_rules = [
-            ("một việc rất phức tạp", "việc khó"),
-            ("thực sự", ""),
-            ("rất quan trọng", "quan trọng"),
-            ("một cách nhanh chóng", "nhanh"),
-            ("vào cùng một lúc", "một lúc"),
-            ("khoảng ", ""),
-        ]
-
-        shortened = text
-
-        for src, dst in generic_rules:
-            shortened = shortened.replace(src, dst)
-            shortened = self.normalize_text(shortened)
-
-            if len(shortened) <= max_chars:
+        # Ưu tiên các field bản dịch tiếng Việt
+        for key in (
+            "translated_text",
+            "translation",
+            "text_vi",
+            "vi_text",
+            "target_text",
+            "text",
+        ):
+            if key in item and item.get(key):
+                item[key] = self.process(item.get(key))
                 break
 
-        return shortened
+        return item
 
-    def ensure_final_punctuation(self, text: str) -> str:
-        if not text:
-            return text
+    def postprocess_segment(self, segment: dict) -> dict:
+        return self.process_segment(segment)
 
-        if text[-1] not in ".!?…":
-            text += "."
-
-        return text
-
-    def postprocess_text(
-        self,
-        vi_text: str,
-        source_text: str | None = None,
-        duration_sec: float | None = None,
-    ) -> str:
+    def process_segments(self, segments):
         if not self.enabled:
-            return vi_text
+            return segments
 
-        text = self.normalize_text(vi_text)
-        text = self.apply_replacements(text)
-        text = self.soften_spoken_style(text)
-        text = self.shorten_text_for_tts(text, duration_sec)
-        text = self.normalize_text(text)
-        text = self.ensure_final_punctuation(text)
+        # Nếu file đang có hàm postprocess_vi_segments thì dùng luôn
+        fn = globals().get("postprocess_vi_segments")
+        if callable(fn):
+            try:
+                return fn(segments, replacements=self.replacements)
+            except TypeError:
+                try:
+                    return fn(segments)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
-        return text
+        return [self.process_segment(seg) for seg in (segments or [])]
 
-    def postprocess_segments(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        output: List[Dict[str, Any]] = []
-
-        for item in segments:
-            new_item = dict(item)
-
-            raw_vi_text = new_item.get("vi_text", "")
-            source_text = new_item.get("source_text") or new_item.get("text") or ""
-
-            start = float(new_item.get("start", 0.0))
-            end = float(new_item.get("end", start))
-            duration_sec = max(0.0, end - start)
-
-            processed_vi_text = self.postprocess_text(
-                vi_text=raw_vi_text,
-                source_text=source_text,
-                duration_sec=duration_sec,
-            )
-
-            new_item["raw_vi_text"] = raw_vi_text
-            new_item["vi_text"] = processed_vi_text
-
-            output.append(new_item)
-
-        return output
+    def postprocess_segments(self, segments):
+        return self.process_segments(segments)
 
 
-def build_vi_postprocessor(config: Dict[str, Any]) -> VietnamesePostProcessor:
-    cfg = config.get("postprocess", {})
+def build_vi_postprocessor(config=None, replacements=None, enabled: bool = True, **kwargs):
+    """
+    Factory tương thích với translator.py cũ.
+    """
+
+    final_replacements = replacements or []
+
+    # Nếu config truyền vào có replacements thì lấy thêm
+    try:
+        if isinstance(config, dict):
+            cfg_replacements = config.get("replacements") or config.get("glossary_replacements") or []
+            if cfg_replacements:
+                final_replacements = cfg_replacements
+    except Exception:
+        pass
 
     return VietnamesePostProcessor(
-        enabled=cfg.get("enabled", True),
-        style=cfg.get("style", "natural_spoken"),
-        shorten_for_tts=cfg.get("shorten_for_tts", False),
-        max_chars_per_second=cfg.get("max_chars_per_second", 17.0),
-        replacements=cfg.get("replacements", []),
-        glossary_files=cfg.get("glossary_files", []),
+        replacements=final_replacements,
+        enabled=enabled,
+        **kwargs,
     )
