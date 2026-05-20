@@ -289,7 +289,10 @@ class VideoRenderer:
                 "23",
                 "-c:a",
                 "aac",
-                "-shortest",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
                 str(output_path),
             ]
 
@@ -308,7 +311,10 @@ class VideoRenderer:
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
 
@@ -358,7 +364,10 @@ class VideoRenderer:
                 "23",
                 "-c:a",
                 "aac",
-                "-shortest",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
                 str(output_path),
             ]
 
@@ -385,7 +394,10 @@ class VideoRenderer:
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
 

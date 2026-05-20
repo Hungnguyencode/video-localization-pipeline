@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from main_pipeline import VideoLocalizationPipeline
+from src.batch.batch_processor import BatchProcessor, make_batch_run_id, safe_name
 from src.tts.voice_profiles import (
     DEFAULT_VOICE_LABEL,
     DEFAULT_VOICE_VALUE,
@@ -139,9 +140,166 @@ def get_pipeline() -> VideoLocalizationPipeline:
     return VideoLocalizationPipeline()
 
 
-# =========================
-# Basic helpers
-# =========================
+def run_batch_process_ui() -> None:
+    st.markdown(
+        """
+        <div class="app-card batch-card">
+          <div>
+            <h2>📦 Batch process nhẹ</h2>
+            <p class="muted">
+              Chạy nhiều video tuần tự bằng cùng cấu hình glossary/TTS hiện tại.
+              Có thể batch từ file local, YouTube URL hoặc trộn cả hai.
+            </p>
+          </div>
+          <div class="hint-box">Nên test 2 video ngắn trước để tránh tốn quota API.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("🚀 Mở batch runner", expanded=False):
+        source_mode = st.radio(
+            "Nguồn batch",
+            ["Upload local", "YouTube URL", "Local + YouTube"],
+            horizontal=True,
+            key="batch_source_mode",
+        )
+
+        batch_uploads = []
+        youtube_urls_text = ""
+        youtube_max_height = 720
+
+        if source_mode in ["Upload local", "Local + YouTube"]:
+            batch_uploads = st.file_uploader(
+                "Chọn nhiều video local",
+                type=["mp4", "mov", "mkv", "webm", "avi", "m4v"],
+                accept_multiple_files=True,
+                key="batch_video_uploads",
+            )
+
+        if source_mode in ["YouTube URL", "Local + YouTube"]:
+            youtube_urls_text = st.text_area(
+                "Dán YouTube URL, mỗi dòng 1 link",
+                placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
+                height=120,
+                key="batch_youtube_urls_text",
+            )
+            youtube_max_height = st.selectbox(
+                "Chất lượng tải YouTube tối đa",
+                [360, 480, 720, 1080],
+                index=2,
+                key="batch_youtube_max_height",
+            )
+
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            run_id = st.text_input(
+                "Tên batch run",
+                value=make_batch_run_id(),
+                key="batch_run_id",
+            )
+        with col_b:
+            stop_on_error = st.checkbox(
+                "Dừng khi gặp lỗi",
+                value=False,
+                key="batch_stop_on_error",
+            )
+
+        local_count = len(batch_uploads or [])
+        youtube_urls = [line.strip() for line in youtube_urls_text.splitlines() if line.strip()]
+        youtube_count = len(youtube_urls)
+        total_count = local_count + youtube_count
+
+        st.caption(
+            f"Đã chọn: {local_count} video local · {youtube_count} YouTube URL · tổng {total_count} video."
+        )
+
+        run_disabled = total_count == 0
+
+        if st.button("🚀 Chạy batch", type="primary", disabled=run_disabled, key="run_batch_btn"):
+            batch_input_dir = PROJECT_ROOT / "data" / "batch_inputs" / run_id
+            batch_input_dir.mkdir(parents=True, exist_ok=True)
+
+            video_paths: list[str] = []
+
+            # 1) Lưu các file local được upload vào data/batch_inputs/<run_id>/
+            for uploaded in batch_uploads or []:
+                safe_name = Path(uploaded.name).name
+                dst = batch_input_dir / safe_name
+                dst.write_bytes(uploaded.getbuffer())
+                video_paths.append(str(dst))
+
+            # 2) Tải từng YouTube URL về data/input rồi đưa path vào batch
+            if youtube_urls:
+                progress = st.progress(0, text="Đang tải video YouTube...")
+                downloaded_count = 0
+                for idx, url in enumerate(youtube_urls, start=1):
+                    try:
+                        progress.progress(
+                            (idx - 1) / max(youtube_count, 1),
+                            text=f"Đang tải YouTube {idx}/{youtube_count}: {url}",
+                        )
+                        result = download_youtube_to_input(url, max_height=int(youtube_max_height))
+                        downloaded_path = result.get("video_path") or result.get("path") or result.get("output_path")
+                        if not downloaded_path:
+                            raise RuntimeError(f"Không tìm thấy video_path trong kết quả tải YouTube: {result}")
+                        video_paths.append(str(downloaded_path))
+                        downloaded_count += 1
+                    except Exception as exc:
+                        if stop_on_error:
+                            progress.empty()
+                            st.error(f"Lỗi tải YouTube URL #{idx}: {url}\n\n{exc}")
+                            st.stop()
+                        st.warning(f"Bỏ qua YouTube URL #{idx} vì tải lỗi: {url} — {exc}")
+
+                progress.progress(1.0, text=f"Đã tải xong {downloaded_count}/{youtube_count} YouTube video.")
+
+            if not video_paths:
+                st.error("Không có video hợp lệ để chạy batch.")
+                st.stop()
+
+            with st.spinner(f"Đang chạy batch {len(video_paths)} video..."):
+                processor = BatchProcessor(
+                    project_root=PROJECT_ROOT,
+                    pipeline_factory=lambda: VideoLocalizationPipeline(),
+                )
+                summary = processor.run(
+                    video_paths,
+                    run_id=run_id,
+                    stop_on_error=stop_on_error,
+                )
+
+            st.success(
+                f"Batch xong: {summary.get('success', 0)} thành công, {summary.get('failed', 0)} lỗi."
+            )
+            st.code(str(summary.get("run_dir", "")))
+
+            summary_json_raw = summary.get("summary_json_path")
+            summary_csv_raw = summary.get("summary_csv_path")
+            summary_json = Path(summary_json_raw) if summary_json_raw else None
+            summary_csv = Path(summary_csv_raw) if summary_csv_raw else None
+
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                if summary_json and summary_json.is_file():
+                    st.download_button(
+                        "Tải summary JSON",
+                        data=summary_json.read_bytes(),
+                        file_name=summary_json.name,
+                        mime="application/json",
+                    )
+            with dl_col2:
+                if summary_csv and summary_csv.is_file():
+                    st.download_button(
+                        "Tải summary CSV",
+                        data=summary_csv.read_bytes(),
+                        file_name=summary_csv.name,
+                        mime="text/csv",
+                    )
+
+            if summary.get("items"):
+                st.dataframe(summary["items"], use_container_width=True)
+
 
 def canonical_rate_label(rate_label: str | None, rate_value: str | None = None) -> str:
     if rate_label and str(rate_label).strip() in RATE_OPTIONS:
@@ -1202,100 +1360,265 @@ def run_prepare_translation(input_path: Path, selected_domain: str, selected_glo
 # UI
 # =========================
 
-st.title("🎬 Video Localization Pipeline")
-st.caption("Việt hóa video ngắn bằng ASR, dịch phụ đề, hiệu chỉnh bản dịch, TTS và lồng tiếng tự động.")
-st.info("Bản v1.5+FPT: split segment thủ công, speaker role, quality checker, auto speed từng segment, report demo và multi-provider TTS Edge/FPT.AI.")
-
-with st.expander("🔑 Cấu hình FPT.AI TTS", expanded=False):
-    if os.getenv("FPT_AI_API_KEY"):
-        st.success("Đã phát hiện FPT_AI_API_KEY. Bạn có thể dùng các giọng FPT.AI trong danh sách voice.")
-    else:
-        st.warning(
-            "Chưa phát hiện FPT_AI_API_KEY. Các giọng Edge vẫn chạy bình thường; "
-            "nếu chọn giọng FPT.AI thì cần tạo file .env ở thư mục gốc project."
-        )
-        st.code("FPT_AI_API_KEY=your_fpt_ai_api_key_here", language="env")
-    st.caption("Không đưa API key thật lên public GitHub. Nếu đã lộ key, nên tạo/reset key mới trong FPT.AI Console.")
-
-with st.expander("📌 Hướng dẫn nhanh", expanded=False):
+def inject_app_theme() -> None:
     st.markdown(
         """
-        **Bước 1:** Chọn glossary, chọn nguồn video, chạy transcript + dịch.  
-        **Bước 2:** Kiểm tra bảng dịch, gán speaker/voice, gộp hoặc tách segment nếu cần.  
-        **Bước 3:** Xem tab kiểm tra chất lượng trước khi render.  
-        **Bước 4:** Render video, sau đó tải video/SRT/JSON/report.
-        """
+        <style>
+        .block-container {
+            max-width: 1180px;
+            padding-top: 2.1rem;
+            padding-bottom: 3rem;
+        }
+        .vp-hero {
+            padding: 1.25rem 1.35rem;
+            border: 1px solid rgba(49, 51, 63, 0.12);
+            border-radius: 22px;
+            background: linear-gradient(135deg, rgba(124, 92, 255, 0.12), rgba(0, 178, 255, 0.08));
+            margin-bottom: 1rem;
+        }
+        .vp-hero h1 {
+            margin: 0 0 .35rem 0;
+            font-size: 2.55rem;
+            line-height: 1.08;
+            letter-spacing: -0.04em;
+        }
+        .vp-hero p {
+            margin: .15rem 0;
+            color: rgba(49, 51, 63, 0.70);
+            font-size: 1rem;
+        }
+        .vp-pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .5rem;
+            margin-top: .85rem;
+        }
+        .vp-pill {
+            padding: .36rem .62rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(49, 51, 63, 0.10);
+            font-size: .86rem;
+            color: rgba(49, 51, 63, 0.78);
+        }
+        .vp-section-title {
+            margin-top: .8rem;
+            margin-bottom: .15rem;
+            font-size: 1.65rem;
+            font-weight: 750;
+            letter-spacing: -0.03em;
+        }
+        .vp-section-caption {
+            color: rgba(49, 51, 63, 0.62);
+            margin-bottom: .65rem;
+        }
+        .vp-step-card {
+            padding: .8rem .9rem;
+            border-radius: 18px;
+            border: 1px solid rgba(49, 51, 63, 0.10);
+            background: rgba(250, 250, 252, 0.90);
+            min-height: 92px;
+        }
+        .vp-step-card b { font-size: .95rem; }
+        .vp-step-card span {
+            display: block;
+            color: rgba(49, 51, 63, 0.62);
+            font-size: .86rem;
+            margin-top: .22rem;
+        }
+        div[data-testid="stExpander"] {
+            border-radius: 16px !important;
+            overflow: hidden;
+        }
+        div[data-testid="stMetric"] {
+            background: rgba(250, 250, 252, 0.72);
+            border: 1px solid rgba(49, 51, 63, 0.08);
+            border-radius: 16px;
+            padding: .75rem .85rem;
+        }
+        .stButton > button {
+            border-radius: 12px !important;
+            font-weight: 650 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-# Glossary UI
-st.subheader("0. Cấu hình dịch và glossary")
+
+def render_app_header() -> None:
+    st.markdown(
+        """
+        <div class="vp-hero">
+          <h1>🎬 Video Localization Pipeline</h1>
+          <p>Việt hoá video ngắn bằng ASR → dịch có glossary → kiểm tra segment → TTS Edge/FPT.AI → lồng tiếng.</p>
+          <div class="vp-pill-row">
+            <span class="vp-pill">v1.5+FPT</span>
+            <span class="vp-pill">Multi-provider TTS</span>
+            <span class="vp-pill">Auto speed / auto-fit</span>
+            <span class="vp-pill">Quality checker</span>
+            <span class="vp-pill">Batch process</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_workflow_overview() -> None:
+    cols = st.columns(4)
+    steps = [
+        ("0", "Cấu hình", "Glossary, domain, từ thay thế"),
+        ("1", "Nguồn video", "Upload local hoặc YouTube URL"),
+        ("2", "Sửa bản dịch", "Gộp/tách segment, gán speaker/voice"),
+        ("3", "Render", "Kiểm tra chất lượng rồi xuất video"),
+    ]
+    for col, (num, title, desc) in zip(cols, steps):
+        with col:
+            st.markdown(
+                f"""
+                <div class="vp-step-card">
+                    <b>{num}. {title}</b>
+                    <span>{desc}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+inject_app_theme()
+render_app_header()
+render_workflow_overview()
+
+with st.expander("🔑 Cấu hình API và hướng dẫn nhanh", expanded=False):
+    api_col, guide_col = st.columns([0.42, 0.58])
+    with api_col:
+        st.markdown("##### FPT.AI TTS")
+        if os.getenv("FPT_AI_API_KEY"):
+            st.success("Đã phát hiện FPT_AI_API_KEY. Có thể dùng các giọng FPT.AI trong danh sách voice.")
+        else:
+            st.warning("Chưa thấy FPT_AI_API_KEY. App vẫn chạy được bằng Edge TTS, còn FPT.AI sẽ bị bỏ qua/fallback.")
+        st.caption("Không đưa API key thật lên public GitHub. Nếu đã lộ key, nên tạo/reset key mới trong FPT.AI Console.")
+    with guide_col:
+        st.markdown("##### Quy trình demo")
+        st.markdown(
+            "**Bước 1:** Chọn glossary, chọn nguồn video, chạy transcript + dịch.  \
+"
+            "**Bước 2:** Kiểm tra bảng dịch, gán speaker/voice, gộp hoặc tách segment nếu cần.  \
+"
+            "**Bước 3:** Xem tab kiểm tra chất lượng trước khi render.  \
+"
+            "**Bước 4:** Render video, sau đó tải video/SRT/JSON/report."
+        )
+
+# 0. Cấu hình dịch/glossary
+st.markdown('<div class="vp-section-title">0. Cấu hình dịch và glossary</div>', unsafe_allow_html=True)
+st.markdown('<div class="vp-section-caption">Chọn lĩnh vực trước khi chạy transcript/dịch để Gemini dùng đúng ngữ cảnh và bộ thay thế.</div>', unsafe_allow_html=True)
+
 with st.expander("🌐 Glossary theo lĩnh vực", expanded=True):
     selected_domain = st.selectbox("Chọn lĩnh vực video", options=list(GLOSSARY_DOMAIN_OPTIONS.keys()), index=3)
     selected_glossary_files = GLOSSARY_DOMAIN_OPTIONS[selected_domain]
     selected_content_domain = GEMINI_CONTENT_DOMAIN_OPTIONS.get(selected_domain, "general")
     selected_style_hint = GEMINI_DOMAIN_STYLE_HINTS.get(selected_domain, "")
+
     st.info(
-        f"Gemini sẽ dùng content_domain=`{selected_content_domain}` và pronoun_style=`auto`. "
-        f"{selected_style_hint}"
+        f"Gemini sẽ dùng content_domain={selected_content_domain} và pronoun_style={selected_style_hint}."
     )
+
     st.caption("Glossary files đang dùng:")
     for glossary_file in selected_glossary_files:
         st.code(glossary_file, language="text")
+
     quick_replacement_text = st.text_area(
         "Quick replacements thêm cho video này",
         value="",
-        height=120,
         placeholder="Ví dụ:\n13.000 => mười ba nghìn\nMiddle East => Trung Đông\nairlines => các hãng hàng không",
+        height=110,
     )
 
-# Video source
-st.subheader("0.5. Chọn nguồn video")
-source_mode = st.radio("Nguồn video", options=["Upload file local", "YouTube URL"], horizontal=True)
+# 0.5 Chọn nguồn video
+st.markdown('<div class="vp-section-title">0.5. Chọn nguồn video</div>', unsafe_allow_html=True)
+st.markdown('<div class="vp-section-caption">Chạy một video để kiểm tra thủ công, hoặc dùng batch runner nhẹ bên dưới cho nhiều video.</div>', unsafe_allow_html=True)
+
+if "single_video_input_path" not in st.session_state:
+    st.session_state.single_video_input_path = ""
+
 input_path: Path | None = None
+if st.session_state.single_video_input_path:
+    cached_input_path = Path(st.session_state.single_video_input_path)
+    if cached_input_path.exists():
+        input_path = cached_input_path
 
-if source_mode == "Upload file local":
-    uploaded_file = st.file_uploader("Upload 1 video ngắn", type=["mp4", "mov", "mkv", "avi", "webm"])
-    if uploaded_file is not None:
-        input_dir = PROJECT_ROOT / "data" / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        input_path = input_dir / uploaded_file.name
-        with input_path.open("wb") as f:
-            f.write(uploaded_file.read())
-        st.success(f"Đã nhận video local: {input_path.name}")
-else:
-    youtube_url = st.text_input("Nhập YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
-    max_height_label = st.selectbox("Giới hạn độ phân giải tải về", options=["480p - nhẹ, nhanh", "720p - cân bằng", "1080p - nặng hơn"], index=1)
-    max_height_map = {"480p - nhẹ, nhanh": 480, "720p - cân bằng": 720, "1080p - nặng hơn": 1080}
-    if st.button("Tải video YouTube về data/input", type="primary", width="stretch"):
-        with st.spinner("Đang tải video từ YouTube bằng yt-dlp..."):
-            try:
-                download_result = download_youtube_to_input(url=youtube_url, max_height=max_height_map[max_height_label])
-                st.session_state["youtube_download_result"] = download_result
-                st.success("Đã tải video YouTube thành công.")
-                st.rerun()
-            except Exception as e:
-                st.error("Lỗi khi tải video YouTube.")
-                st.exception(e)
-    if "youtube_download_result" in st.session_state:
-        download_result = st.session_state["youtube_download_result"]
-        input_path = Path(download_result["video_path"])
-        st.markdown("**Video YouTube đã tải:**")
-        st.json({"title": download_result.get("title"), "duration": download_result.get("duration"), "video_path": download_result.get("video_path"), "max_height": download_result.get("max_height")})
+with st.container(border=True):
+    source_mode = st.radio("Nguồn video", ["Upload file local", "YouTube URL"], horizontal=True)
 
-# Prepare
+    if source_mode == "Upload file local":
+        uploaded_file = st.file_uploader(
+            "Upload 1 video ngắn",
+            type=["mp4", "mov", "mkv", "avi", "webm"],
+        )
+        if uploaded_file is not None:
+            input_dir = PROJECT_ROOT / "data" / "input"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            input_path = input_dir / Path(uploaded_file.name).name
+            with input_path.open("wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state.single_video_input_path = str(input_path)
+            st.success(f"Đã nhận video local: {input_path.name}")
+
+    else:
+        youtube_url = st.text_input("Dán link YouTube", placeholder="https://www.youtube.com/watch?v=...")
+        youtube_name = st.text_input("Tên file lưu", value="youtube_video")
+        if st.button("⬇️ Tải video từ YouTube"):
+            if not youtube_url.strip():
+                st.error("Bạn cần dán YouTube URL trước.")
+            else:
+                try:
+                    with st.spinner("Đang tải video YouTube..."):
+                        download_result = download_youtube_to_input(
+                            youtube_url.strip(),
+                            max_height=720,
+                        )
+
+                    if isinstance(download_result, (str, Path)):
+                        input_path = Path(download_result)
+                    elif isinstance(download_result, dict):
+                        video_path = (
+                            download_result.get("video_path")
+                            or download_result.get("path")
+                            or download_result.get("output_path")
+                        )
+                        if not video_path:
+                            raise RuntimeError(f"Không tìm thấy video_path trong kết quả tải YouTube: {download_result}")
+                        input_path = Path(video_path)
+                    else:
+                        raise RuntimeError(f"Kết quả tải YouTube không hợp lệ: {download_result}")
+
+                    st.session_state.single_video_input_path = str(input_path)
+                    st.success(f"Đã tải video: {input_path.name}")
+
+                    if isinstance(download_result, dict):
+                        title = download_result.get("title", "")
+                        if title:
+                            st.caption(f"Title: {title}")
+                except Exception as e:
+                    st.error(f"Lỗi tải YouTube: {e}")
+
+# Batch runner đặt dưới phần chọn nguồn video để bố cục không bị nhảy lên đầu trang
+run_batch_process_ui()
+
 if input_path is not None and input_path.exists():
-    st.subheader("1. Video đầu vào")
+    st.markdown('<div class="vp-section-title">1. Chạy transcript + dịch</div>', unsafe_allow_html=True)
     st.video(str(input_path))
-    col_prepare, col_reset = st.columns([2, 1])
-    with col_prepare:
-        prepare_button = st.button("Bước 1: Tạo transcript + bản dịch", type="primary", width="stretch")
-    with col_reset:
-        reset_button = st.button("Reset phiên làm việc", width="stretch")
-    if reset_button:
-        reset_working_state()
-        st.success("Đã reset trạng thái giao diện. File trong thư mục data vẫn được giữ nguyên.")
-        st.rerun()
-    if prepare_button:
+
+    with st.container(border=True):
+        col_run, col_hint = st.columns([0.38, 0.62], vertical_alignment="center")
+        with col_run:
+            prepare_clicked = st.button("🚀 Bước 1: Tạo transcript + dịch", type="primary")
+        with col_hint:
+            st.caption("Sau bước này bạn sẽ kiểm tra bảng dịch, tách/gộp segment, gán speaker/voice rồi render.")
+
+    if prepare_clicked:
         run_prepare_translation(input_path, selected_domain, selected_glossary_files, quick_replacement_text)
 
 # Editor
@@ -1882,4 +2205,5 @@ if "render_result" in st.session_state:
         )
 
     with st.expander("Thông tin pipeline"):
-        st.json(result)
+        st.json(result)        
+                      
